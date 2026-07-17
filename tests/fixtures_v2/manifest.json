@@ -1,0 +1,44 @@
+[
+  {
+    "name": "conc_arma_101",
+    "llf": -488.4805439980504,
+    "burn": 0,
+    "k_states": 2,
+    "k_params": 2
+  },
+  {
+    "name": "trend_ct_arma_100",
+    "llf": -357.1980204587399,
+    "burn": 0,
+    "k_states": 1,
+    "k_params": 4
+  },
+  {
+    "name": "missing_arma_101",
+    "llf": -368.1983463706547,
+    "burn": 0,
+    "k_states": 2,
+    "k_params": 3
+  },
+  {
+    "name": "nodiff_arima_111",
+    "llf": -351.6953945959656,
+    "burn": 1,
+    "k_states": 3,
+    "k_params": 3
+  },
+  {
+    "name": "nodiff_sarimax_011_011_12",
+    "llf": 245.7577023113799,
+    "burn": 13,
+    "k_states": 27,
+    "k_params": 5
+  },
+  {
+    "name": "kitchen_sink",
+    "llf": -265.1813438446397,
+    "burn": 5,
+    "k_states": 11,
+    "k_params": 6
+  }
+]
