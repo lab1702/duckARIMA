@@ -53,6 +53,41 @@ CREATE TABLE m2 AS SELECT * FROM sarimax_fit('sales', 'units', 1, 1, 1,
                                              simple_differencing := false);
 ```
 
+## Larger-than-memory fitting
+
+DuckDB can spill relational sorts, joins, windows, and hash aggregates to a
+temporary directory.  The regular fit path intentionally packs the timeline
+into ordered `LIST` values for speed and bitwise determinism; DuckDB cannot
+spill those aggregate states.  Select the relational likelihood explicitly
+when the series may not fit in memory:
+
+```sql
+SET memory_limit = '8GB';
+SET temp_directory = '/fast/local/duckdb-spill';
+SET max_temp_directory_size = '100GB';
+SET threads = 4;
+SET preserve_insertion_order = false;
+
+CREATE TABLE m_large AS
+SELECT * FROM sarimax_fit(
+    'large_sales', 'units', 1, 1, 1,
+    t_col := 'timestamp',             -- required and must be unique
+    out_of_core := true,
+    compute_bse := false);            -- recommended for very large fits
+```
+
+`out_of_core := true` keeps observations relational through every likelihood
+pass and retains only the current Kalman state per parameter probe.  Resource
+settings remain session-level and caller-controlled.  `compute_bse := false`
+skips the numerical Hessian's O(parameter_count²) full-data passes and emits
+NULL standard errors; it does not change fitted coefficients or forecasts.
+
+This is a correctness-first escape hatch, not a promise that very long fits
+will be fast: BFGS still needs many sequential O(n·state_dimension³) filter
+passes.  The residual, evaluation, and Ljung–Box helpers retain full-trace or
+whole-series intermediates and are not yet covered by the out-of-core
+contract.  See `GUIDE.md` for tuning, determinism, and verification details.
+
 Note: the seasonal orders are `sp` (seasonal AR), `sd` (seasonal
 differencing), `sq` (seasonal MA) — DuckDB macro parameters are
 case-insensitive, so the textbook `P/D/Q` names would collide with `p/d/q`.

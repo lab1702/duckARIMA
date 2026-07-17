@@ -8,7 +8,7 @@ are case-insensitive so P/p would collide). `s` is the season length.
 
 ---
 
-### sarimax_fit(data, y_col, p, d, q, sp := 0, sd := 0, sq := 0, s := 1, exog_cols := [], t_col := NULL, trend := 'n', concentrate := false, simple_differencing := true)
+### sarimax_fit(data, y_col, p, d, q, sp := 0, sd := 0, sq := 0, s := 1, exog_cols := [], t_col := NULL, trend := 'n', concentrate := false, simple_differencing := true, out_of_core := false, compute_bse := true)
 
 Fit a SARIMAX(p,d,q)(sp,sd,sq)_s by maximum likelihood. Returns the **model
 table** — materialize it: `CREATE TABLE m AS SELECT * FROM sarimax_fit(...)`.
@@ -32,6 +32,13 @@ table** — materialize it: `CREATE TABLE m AS SELECT * FROM sarimax_fit(...)`.
   and filters the raw series with the differencing states in the state
   vector (statsmodels' default formulation; burn-in of d + s·sd steps in
   the loglikelihood).
+- `out_of_core` — use the relational, spill-compatible likelihood instead of
+  the faster whole-series `LIST` kernel. Requires an explicit unique `t_col`.
+  Configure `memory_limit`, `temp_directory`, and `max_temp_directory_size`
+  on the DuckDB session before fitting.
+- `compute_bse` — compute numerical-Hessian standard errors (default true).
+  Set false for large fits to avoid O(parameter_count²) extra full-data
+  likelihood passes; `bse` rows are retained with NULL values.
 - Missing `y` (NULL) is allowed — filtered over, not rejected. Exog must be
   complete.
 - Model table schema: `(kind, name, idx, value, value_list)` with kinds

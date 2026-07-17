@@ -1351,6 +1351,137 @@ CREATE OR REPLACE MACRO _sarimax_ll_x_v2(xunc, ylist, xmat, degs,
       ylist, xmat, degs, r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
 );
 
+-- Relational likelihood for larger-than-memory inputs.  Unlike
+-- _sarimax_ll_c_v2 this path never packs the observation timeline into one
+-- LIST: DuckDB can keep the source, joins, and ordering work in its external
+-- operator pipeline while _sarimax_kfilter_state_v2 retains only the current
+-- state for each probe.  Initial covariance comes from the relational system
+-- builder's Lyapunov solve (rather than the fast scalar kernel's 30-step
+-- doubling approximation), so the two paths agree to filter tolerance rather
+-- than promising bitwise identity.
+CREATE OR REPLACE MACRO _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
+                                             r, p, q, bigp, bigq, s, d, sd,
+                                             ktrend, conc) AS (
+  (WITH _sarimax_lro_pr AS (
+       SELECT 1::BIGINT AS probe_id, cpar AS params
+   ),
+   _sarimax_lro_sys AS (
+       SELECT * FROM _sarimax_systems_v2('_sarimax_lro_pr',
+           r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+   ),
+   -- Indirection CTEs keep query_table() names local to this scalar expansion.
+   _sarimax_lro_y AS (SELECT * FROM query_table(y_tbl)),
+   _sarimax_lro_x AS (SELECT * FROM query_table(exog_tbl)),
+   _sarimax_lro_d AS (SELECT * FROM query_table(degs_tbl)),
+   _sarimax_lro_obs AS (
+       SELECT * FROM _sarimax_obs_adj_v2_ooc('_sarimax_lro_y', '_sarimax_lro_x',
+           '_sarimax_lro_pr', r, ktrend, '_sarimax_lro_d')
+   ),
+   _sarimax_lro_ll AS (
+       SELECT * FROM _sarimax_loglik_v2('_sarimax_lro_obs', '_sarimax_lro_sys', conc)
+   )
+   SELECT struct_pack(
+       ll := CASE WHEN loglik IS NOT NULL AND isfinite(loglik)
+                  THEN loglik ELSE NULL END,
+       scale2 := CASE WHEN conc THEN scale2
+                      ELSE cpar[ktrend + r + p + q + bigp + bigq + 1] END)
+   FROM _sarimax_lro_ll)
+);
+
+CREATE OR REPLACE MACRO _sarimax_ll_x_ooc_v2(xunc, y_tbl, exog_tbl, degs_tbl,
+                                             r, p, q, bigp, bigq, s, d, sd,
+                                             ktrend, conc) AS (
+  _sarimax_ll_c_ooc_v2(
+      _sarimax_transform_params_v2(xunc, ktrend + r, p, q, bigp, bigq, conc),
+      y_tbl, exog_tbl, degs_tbl,
+      r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+);
+
+CREATE OR REPLACE MACRO _sarimax_ll_c_eval_v2(cpar, ylist, xmat, degs,
+                                              y_tbl, exog_tbl, degs_tbl,
+                                              r, p, q, bigp, bigq, s, d, sd,
+                                              ktrend, conc, out_of_core) AS (
+  CASE WHEN out_of_core
+       THEN _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
+                                 r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+       ELSE _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
+                             r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+  END
+);
+
+-- Dispatch kept in one macro so every optimizer call site has the same lazy,
+-- literal-gated choice.  The empty LIST placeholders used by out_of_core
+-- callers are never read on the relational branch.
+CREATE OR REPLACE MACRO _sarimax_ll_x_eval_v2(xunc, ylist, xmat, degs,
+                                              y_tbl, exog_tbl, degs_tbl,
+                                              r, p, q, bigp, bigq, s, d, sd,
+                                              ktrend, conc, out_of_core) AS (
+  CASE WHEN out_of_core
+       THEN _sarimax_ll_x_ooc_v2(xunc, y_tbl, exog_tbl, degs_tbl,
+                                 r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+       ELSE _sarimax_ll_x_v2(xunc, ylist, xmat, degs,
+                             r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+  END
+);
+
+-- Spill-safe, deliberately conservative starting point.  The high-throughput
+-- path keeps the Hannan-Rissanen initializer below; its many ordered LIST
+-- folds are inappropriate under a hard memory budget.  Zero trend/exog/ARMA
+-- coefficients are stationary and invertible, and the only data aggregate is
+-- a streaming scalar second moment.  For raw integrated levels this can be a
+-- conservative overestimate of innovation variance, but it stays bounded.
+CREATE OR REPLACE MACRO _sarimax_start_params_ooc_v2(y_tbl,
+                                                     r, p, q, bigp, bigq,
+                                                     s, d, sd, ktrend,
+                                                     conc) AS TABLE
+WITH _sarimax_spo_stats AS (
+    SELECT count(*)::BIGINT AS zn,
+           count(y) FILTER (
+               WHERE t > _sarimax_kdiff(d, sd, s))::BIGINT AS zny,
+           avg(y * y) FILTER (WHERE y IS NOT NULL) AS zm2
+    FROM query_table(y_tbl)
+),
+_sarimax_spo_sig AS (
+    SELECT CASE
+             WHEN zn <= _sarimax_kdiff(d, sd, s)
+               THEN error(concat('duckARIMA v2 start values: n_eff = ',
+                                 greatest(zn - _sarimax_kdiff(d, sd, s), 0),
+                                 ' (model scale) leaves no observations after differencing'))
+             WHEN zny = 0
+               THEN error('duckARIMA v2 start values: model-scale series has no usable observations after burn-in')
+             WHEN p + q + bigp + bigq > 0
+                  AND zn - _sarimax_kdiff(d, sd, s) <
+                      greatest(
+                          p + s * bigp + 1,
+                          CASE WHEN q + bigq > 0
+                               THEN least(
+                                      greatest(20, 2 * greatest(p + s * bigp,
+                                                                q + s * bigq))::BIGINT,
+                                      (zn - _sarimax_kdiff(d, sd, s) - 1) // 2)
+                                    + 1 + q + s * bigq
+                               ELSE 1 END)
+                      + p + q + bigp + bigq
+               THEN error(concat(
+                      'duckARIMA v2 start values: n_eff = ',
+                      zn - _sarimax_kdiff(d, sd, s),
+                      ' (model scale) is too small for the requested ARMA order'))
+             WHEN zm2 IS NOT NULL AND isfinite(zm2) AND zm2 > 0e0
+               THEN zm2
+             ELSE 1e0
+           END AS zsig2
+    FROM _sarimax_spo_stats
+),
+_sarimax_spo_z AS (
+    SELECT list_transform(
+               range(1, ktrend + r + p + q + bigp + bigq + 1),
+               lambda zi: 0e0) AS zzero,
+           zsig2
+    FROM _sarimax_spo_sig
+)
+SELECT zzero || CASE WHEN conc THEN []::DOUBLE[] ELSE [sqrt(zsig2)] END AS x0,
+       zzero || CASE WHEN conc THEN []::DOUBLE[] ELSE [zsig2] END AS params0
+FROM _sarimax_spo_z;
+
 -- ---- 3c. starting values (v2: differencing, missing values, trend, conc) -------
 
 -- One row (x0 DOUBLE[] unconstrained, params0 DOUBLE[] constrained), v2
@@ -2146,21 +2277,32 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
 -- asserts ll >= statsmodels' ll - 1e-8 at the endpoint.
 CREATE OR REPLACE MACRO _sarimax_bfgs_v2(y_tbl, exog_tbl, degs_tbl,
                                          r, p, q, bigp, bigq, s, d, sd,
-                                         ktrend, conc) AS TABLE
+                                         ktrend, conc, out_of_core := false) AS TABLE
 WITH RECURSIVE
 _sarimax_bf2_pc AS (
-    SELECT (SELECT list(y ORDER BY t) FROM query_table(y_tbl)) AS zwl,
-           coalesce((SELECT list(zxr ORDER BY t)
-                     FROM (SELECT t, list(x ORDER BY j) AS zxr
-                           FROM query_table(exog_tbl) GROUP BY t)),
-                    []::DOUBLE[][]) AS zxm,
+    SELECT CASE WHEN out_of_core THEN []::DOUBLE[]
+                ELSE (SELECT list(y ORDER BY t) FROM query_table(y_tbl)) END AS zwl,
+           CASE WHEN out_of_core THEN []::DOUBLE[][]
+                ELSE coalesce((SELECT list(zxr ORDER BY t)
+                               FROM (SELECT t, list(x ORDER BY j) AS zxr
+                                     FROM query_table(exog_tbl) GROUP BY t)),
+                              []::DOUBLE[][]) END AS zxm,
            (SELECT coalesce(list(degree ORDER BY idx), []::BIGINT[])
             FROM query_table(degs_tbl)) AS zdg,
            (ktrend + r + p + q + bigp + bigq
-            + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp,
+             + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp,
            zsp.x0 AS zx0
-    FROM _sarimax_start_params_v2(y_tbl, exog_tbl, degs_tbl,
-                                  r, p, q, bigp, bigq, s, d, sd, ktrend, conc) zsp
+    FROM (
+        SELECT x0, params0
+        FROM _sarimax_start_params_v2(y_tbl, exog_tbl, degs_tbl,
+                                      r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+        WHERE NOT out_of_core
+        UNION ALL
+        SELECT x0, params0
+        FROM _sarimax_start_params_ooc_v2(y_tbl, r, p, q, bigp, bigq,
+                                          s, d, sd, ktrend, conc)
+        WHERE out_of_core
+    ) zsp
 ),
 _sarimax_bf2_it USING KEY (zkk) AS (
     -- ---------------- anchor: f and gradient at x0 ----------------
@@ -2181,7 +2323,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                    / (2e0 * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(za1.zx[zi])))) AS zg_new
         FROM (
             SELECT zpc.zx0 AS zx, zpc.znp,
-                   CASE WHEN ktrend + r >= 2
+                   CASE WHEN NOT out_of_core
+                             AND ktrend + r >= 2
                              AND _sarimax_kdiff(d, sd, s)
                                  + _sarimax_k_states(p, q, bigp, bigq, s) >= 20
                         THEN 0e0 - (_sarimax_ll_mean_v2(zgl0.zgn0,
@@ -2192,9 +2335,11 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                          lambda za9, zb9: za9 + zb9)),
                                  _sarimax_trend_c(zpc.zdg, list_slice(zpc.zx0, 1, ktrend),
                                                   1, len(zpc.zwl) + 1))).ll
-                        ELSE 0e0 - (_sarimax_ll_x_v2(zpc.zx0, zpc.zwl, zpc.zxm,
-                                        zpc.zdg, r, p, q, bigp, bigq, s, d, sd,
-                                        ktrend, conc)).ll END AS zfx,
+                        ELSE 0e0 - (_sarimax_ll_x_eval_v2(
+                                        zpc.zx0, zpc.zwl, zpc.zxm, zpc.zdg,
+                                        y_tbl, exog_tbl, degs_tbl,
+                                        r, p, q, bigp, bigq, s, d, sd,
+                                        ktrend, conc, out_of_core)).ll END AS zfx,
                    zag.zfpm
             FROM _sarimax_bf2_pc zpc
             CROSS JOIN LATERAL (
@@ -2211,7 +2356,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                            r, p, q, bigp, bigq, s, d, sd, ktrend, conc)) AS zgn0
                 FROM (SELECT zpc.zx0 AS zx0c, zpc.zwl AS zwlc, zpc.zxm AS zxmc,
                              zpc.zdg AS zdgc
-                      FROM unnest(CASE WHEN ktrend + r >= 2
+                       FROM unnest(CASE WHEN NOT out_of_core
+                                        AND ktrend + r >= 2
                                        AND _sarimax_kdiff(d, sd, s)
                                            + _sarimax_k_states(p, q, bigp, bigq, s) >= 20
                                        THEN [1] ELSE []::BIGINT[] END) AS zu9(zn9))
@@ -2227,7 +2373,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                 SELECT list(zval ORDER BY zidx) AS zfpm
                 FROM (
                     SELECT zidx,
-                           CASE WHEN ktrend + r >= 2
+                           CASE WHEN NOT out_of_core
+                                     AND ktrend + r >= 2
                                      AND _sarimax_kdiff(d, sd, s)
                                          + _sarimax_k_states(p, q, bigp, bigq, s) >= 20
                                      AND zidx <= 2 * (ktrend + r)
@@ -2258,14 +2405,15 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                       * greatest(1e0, abs(zxc[zg9]))
                                                  ELSE zxc[zg9] END),
                                         1, len(zwlc) + 1))).ll
-                                ELSE 0e0 - (_sarimax_ll_x_v2(
+                                ELSE 0e0 - (_sarimax_ll_x_eval_v2(
                                     list_transform(zxc, lambda zxe, zxi:
                                         CASE WHEN zxi = (zidx + 1) // 2
                                              THEN zxe + (CASE WHEN zidx % 2 = 1 THEN 1e0 ELSE -1e0 END)
                                                         * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(zxe))
                                              ELSE zxe END),
-                                    zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
-                                    ktrend, conc)).ll END AS zval
+                                    zwlc, zxmc, zdgc, y_tbl, exog_tbl, degs_tbl,
+                                    r, p, q, bigp, bigq, s, d, sd,
+                                    ktrend, conc, out_of_core)).ll END AS zval
                     FROM (SELECT zpc.zx0 AS zxc, zpc.zwl AS zwlc, zpc.zxm AS zxmc,
                                  zpc.zdg AS zdgc, zgl0.zgn0 AS zgnc, zu.zidx
                           FROM unnest(range(1, 2 * zpc.znp + 1)) AS zu(zidx))
@@ -2511,12 +2659,13 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                             FROM (
                                                                                 SELECT zfxc, zgdc,
                                                                                        zalpha,
-                                                                                       0e0 - (_sarimax_ll_x_v2(
+                                                                                       0e0 - (_sarimax_ll_x_eval_v2(
                                                                                            list_transform(zxc, lambda zxe, zxi:
                                                                                                zxe + zalpha * zdirc[zxi]),
                                                                                            zwlc, zxmc, zdgc,
+                                                                                           y_tbl, exog_tbl, degs_tbl,
                                                                                            r, p, q, bigp, bigq, s, d, sd,
-                                                                                           ktrend, conc)).ll AS zfa
+                                                                                           ktrend, conc, out_of_core)).ll AS zfa
                                                                                 FROM (SELECT zs0b.zx AS zxc, zs0b.zdir AS zdirc,
                                                                                              zs0b.zfx AS zfxc, zs0b.zgd AS zgdc,
                                                                                              zs0b.zwl AS zwlc, zs0b.zxm AS zxmc,
@@ -2533,12 +2682,13 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                                    END) AS zbestb
                                                                         FROM (
                                                                             SELECT zfxc, zgdc, zalpha,
-                                                                                   0e0 - (_sarimax_ll_x_v2(
+                                                                                   0e0 - (_sarimax_ll_x_eval_v2(
                                                                                        list_transform(zxc, lambda zxe, zxi:
                                                                                            zxe + zalpha * zdirc[zxi]),
                                                                                        zwlc, zxmc, zdgc,
+                                                                                       y_tbl, exog_tbl, degs_tbl,
                                                                                        r, p, q, bigp, bigq, s, d, sd,
-                                                                                       ktrend, conc)).ll AS zfa
+                                                                                       ktrend, conc, out_of_core)).ll AS zfa
                                                                             FROM (SELECT zs1.zx AS zxc, zs1.zdir AS zdirc,
                                                                                          zs1.zfx AS zfxc, zs1.zgd AS zgdc,
                                                                                          zs1.zwl AS zwlc, zs1.zxm AS zxmc,
@@ -2590,7 +2740,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                              zs2.zrestarted AS zzre,
                                                                              zs2.zwl AS zzwl, zs2.zxm AS zzxm,
                                                                              zs2.zdg AS zzdg
-                                                                      FROM unnest(CASE WHEN ktrend + r >= 2
+                                                                      FROM unnest(CASE WHEN NOT out_of_core
+                                                                                       AND ktrend + r >= 2
                                                                                        AND _sarimax_kdiff(d, sd, s)
                                                                                            + _sarimax_k_states(p, q, bigp, bigq, s) >= 20
                                                                                        THEN [1] ELSE []::BIGINT[] END)
@@ -2610,7 +2761,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                    max(zval) FILTER (WHERE zidx = 0) AS zfe_c
                                                             FROM (
                                                                 SELECT zidx,
-                                                                       CASE WHEN ktrend + r >= 2
+                                                                       CASE WHEN NOT out_of_core
+                                                                                 AND ktrend + r >= 2
                                                                                  AND _sarimax_kdiff(d, sd, s)
                                                                                      + _sarimax_k_states(p, q, bigp, bigq, s) >= 20
                                                                                  AND zidx <= 2 * (ktrend + r)
@@ -2643,7 +2795,7 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                                                   * greatest(1e0, abs(zxc[zg9]))
                                                                                              ELSE zxc[zg9] END),
                                                                                     1, len(zwlc) + 1))).ll
-                                                                            ELSE 0e0 - (_sarimax_ll_x_v2(
+                                                                            ELSE 0e0 - (_sarimax_ll_x_eval_v2(
                                                                                 list_transform(zxc, lambda zxe, zxi:
                                                                                     CASE WHEN zidx > 0
                                                                                               AND zxi = (zidx + 1) // 2
@@ -2653,8 +2805,9 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                                                     * greatest(1e0, abs(zxe))
                                                                                          ELSE zxe END),
                                                                                 zwlc, zxmc, zdgc,
+                                                                                y_tbl, exog_tbl, degs_tbl,
                                                                                 r, p, q, bigp, bigq, s, d, sd,
-                                                                                ktrend, conc)).ll END AS zval
+                                                                                ktrend, conc, out_of_core)).ll END AS zval
                                                                 FROM (SELECT zs3.zx_eval AS zxc,
                                                                              zs3.zwl AS zwlc, zs3.zxm AS zxmc,
                                                                              zs3.zdg AS zdgc,
@@ -2681,7 +2834,7 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                    count(*) AS zn2
                                             FROM (
                                                 SELECT zidx,
-                                                       0e0 - (_sarimax_ll_x_v2(
+                                                       0e0 - (_sarimax_ll_x_eval_v2(
                                                            list_transform(zxc, lambda zxe, zxi:
                                                                CASE WHEN zidx > 0 AND zxi = (zidx + 1) // 2
                                                                     THEN zxe + (CASE WHEN zidx % 2 = 1
@@ -2689,8 +2842,9 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                                * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(zxe))
                                                                     ELSE zxe END),
                                                            zwlc, zxmc, zdgc,
+                                                           y_tbl, exog_tbl, degs_tbl,
                                                            r, p, q, bigp, bigq, s, d, sd,
-                                                           ktrend, conc)).ll AS zval
+                                                           ktrend, conc, out_of_core)).ll AS zval
                                                 FROM (SELECT zs4.zx_r AS zxc, zs4.zwl AS zwlc,
                                                              zs4.zxm AS zxmc, zs4.zdg AS zdgc, zu.zidx
                                                       FROM unnest(CASE WHEN zs4.zrestart2
@@ -2711,8 +2865,10 @@ _sarimax_bf2_it USING KEY (zkk) AS (
 SELECT zit.zx AS x_opt,
        _sarimax_transform_params_v2(zit.zx, ktrend + r, p, q, bigp, bigq, conc) AS params,
        0e0 - zit.zfx AS loglik,
-       (_sarimax_ll_x_v2(zit.zx, zpc.zwl, zpc.zxm, zpc.zdg,
-                         r, p, q, bigp, bigq, s, d, sd, ktrend, conc)).scale2 AS scale2,
+       (_sarimax_ll_x_eval_v2(zit.zx, zpc.zwl, zpc.zxm, zpc.zdg,
+                              y_tbl, exog_tbl, degs_tbl,
+                              r, p, q, bigp, bigq, s, d, sd, ktrend, conc,
+                              out_of_core)).scale2 AS scale2,
        zit.zstatus = 1 AS converged,
        zit.ziter AS iterations,
        list_reduce(list_prepend(0e0, list_transform(zit.zgx, lambda ze: abs(ze))),
@@ -2816,6 +2972,128 @@ _sarimax_bs2_tri AS (     -- upper-triangle H cells, ordered (i, j), i <= j
                 FROM (
                     SELECT zh2.zc AS zcc, zh2.zwl AS zwlc, zh2.zxm AS zxmc,
                            zh2.zdg AS zdgc,
+                           zh2.zhl AS zhlc, zh2.zf0 AS zf0c,
+                           zu1.zi, zu2.zj, (zsg.zst).zs1 AS zs1, (zsg.zst).zs2 AS zs2
+                    FROM unnest(range(1, zh2.znp + 1)) AS zu1(zi)
+                    CROSS JOIN unnest(range(1, zh2.znp + 1)) AS zu2(zj)
+                    CROSS JOIN LATERAL unnest(
+                        CASE WHEN zu2.zj = zu1.zi
+                             THEN [struct_pack(zs1 := 1e0, zs2 := 0e0),
+                                   struct_pack(zs1 := -1e0, zs2 := 0e0)]
+                             ELSE [struct_pack(zs1 := 1e0, zs2 := 1e0),
+                                   struct_pack(zs1 := 1e0, zs2 := -1e0),
+                                   struct_pack(zs1 := -1e0, zs2 := 1e0),
+                                   struct_pack(zs1 := -1e0, zs2 := -1e0)] END)
+                        AS zsg(zst)
+                    WHERE zu2.zj >= zu1.zi
+                )
+            )
+            GROUP BY zi, zj, zf0c, zhlc
+        )
+    ) zgr
+)
+SELECT (list_transform([_sarimax_inv_list(zng.znegh, zng.znp)], lambda zinv:
+           list_transform(range(1, zng.znp + 1), lambda zi6:
+               (list_transform([(zinv.x)[(zi6 - 1) * zng.znp + zi6]], lambda zdv:
+                    CASE WHEN (zinv.ok) AND zdv > 0e0 THEN sqrt(zdv) ELSE NULL END))[1])))[1] AS bse
+FROM (
+    SELECT znp,
+           list_transform(range(1, znp * znp + 1), lambda zidx:
+               -(ztri[(least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1) - 1)
+                      * (znp + 1)
+                      - least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1)
+                        * (least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1) - 1) // 2
+                      + (greatest((zidx - 1) // znp + 1, (zidx - 1) % znp + 1)
+                         - least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1) + 1)])) AS znegh
+    FROM _sarimax_bs2_tri
+) zng;
+
+-- Out-of-core counterpart of _sarimax_bse_v2.  The model-sized parameter,
+-- step, and Hessian probe lists remain bounded; observation data stays in the
+-- relational likelihood pipeline addressed by the three table-name inputs.
+CREATE OR REPLACE MACRO _sarimax_bse_ooc_v2(params, y_tbl, exog_tbl, degs_tbl,
+                                            r, p, q, bigp, bigq, s, d, sd,
+                                            ktrend, conc) AS TABLE
+WITH _sarimax_bs2_in0 AS (
+    SELECT params AS zc,
+           (ktrend + r + p + q + bigp + bigq
+            + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp
+),
+_sarimax_bs2_in AS (
+    SELECT zc, znp,
+           (_sarimax_ll_c_ooc_v2(zc, y_tbl, exog_tbl, degs_tbl,
+                                 r, p, q, bigp, bigq, s, d, sd,
+                                 ktrend, conc)).ll AS zf0
+    FROM _sarimax_bs2_in0
+),
+_sarimax_bs2_h AS (       -- adaptive per-coordinate steps
+    SELECT zin.zc, zin.znp, zin.zf0, zhh.zhl
+    FROM _sarimax_bs2_in zin
+    CROSS JOIN LATERAL (
+        SELECT list(zh ORDER BY zi) AS zhl
+        FROM (
+            SELECT zi,
+                   CASE WHEN (_sarimax_ll_c_ooc_v2(
+                                  list_transform(zcc, lambda zv2, zi2:
+                                      CASE WHEN zi2 = zi THEN zv2 + zh0 ELSE zv2 END),
+                                  y_tbl, exog_tbl, degs_tbl,
+                                  r, p, q, bigp, bigq, s, d, sd,
+                                  ktrend, conc)).ll IS NOT NULL
+                              AND (_sarimax_ll_c_ooc_v2(
+                                      list_transform(zcc, lambda zv2, zi2:
+                                          CASE WHEN zi2 = zi THEN zv2 - zh0 ELSE zv2 END),
+                                      y_tbl, exog_tbl, degs_tbl,
+                                      r, p, q, bigp, bigq, s, d, sd,
+                                      ktrend, conc)).ll IS NOT NULL
+                         THEN zh0
+                         WHEN (_sarimax_ll_c_ooc_v2(
+                                  list_transform(zcc, lambda zv2, zi2:
+                                      CASE WHEN zi2 = zi THEN zv2 + zh0 * 5e-1 ELSE zv2 END),
+                                  y_tbl, exog_tbl, degs_tbl,
+                                  r, p, q, bigp, bigq, s, d, sd,
+                                  ktrend, conc)).ll IS NOT NULL
+                              AND (_sarimax_ll_c_ooc_v2(
+                                      list_transform(zcc, lambda zv2, zi2:
+                                          CASE WHEN zi2 = zi THEN zv2 - zh0 * 5e-1 ELSE zv2 END),
+                                      y_tbl, exog_tbl, degs_tbl,
+                                      r, p, q, bigp, bigq, s, d, sd,
+                                      ktrend, conc)).ll IS NOT NULL
+                         THEN zh0 * 5e-1
+                         ELSE zh0 * 25e-2 END AS zh
+            FROM (SELECT zin.zc AS zcc, zu.zi,
+                         (CASE WHEN d + s * sd > 0 THEN 1e-3 ELSE 1e-4 END)
+                         * greatest(1e-1, abs(zin.zc[zu.zi])) AS zh0
+                  FROM unnest(range(1, zin.znp + 1)) AS zu(zi))
+        )
+    ) zhh
+),
+_sarimax_bs2_tri AS (     -- upper-triangle H cells, ordered (i, j), i <= j
+    SELECT zh2.zc, zh2.znp, zh2.zhl, zgr.ztri
+    FROM _sarimax_bs2_h zh2
+    CROSS JOIN LATERAL (
+        SELECT list(zhv ORDER BY zi, zj) AS ztri
+        FROM (
+            SELECT zi, zj,
+                   CASE WHEN zi = zj
+                        THEN (list_reduce(list_prepend(0e0, list(zfv ORDER BY zs1, zs2)),
+                                          lambda za7, zb7: za7 + zb7)
+                              - 2e0 * zf0c) / (zhlc[zi] * zhlc[zi])
+                        ELSE list_reduce(list_prepend(0e0,
+                                 list(zs1 * zs2 * zfv ORDER BY zs1, zs2)),
+                                 lambda za7, zb7: za7 + zb7)
+                             / (4e0 * zhlc[zi] * zhlc[zj]) END AS zhv
+            FROM (
+                SELECT zi, zj, zs1, zs2, zf0c, zhlc,
+                       (_sarimax_ll_c_ooc_v2(
+                           list_transform(zcc, lambda zv3, zk3:
+                               zv3 + CASE WHEN zk3 = zi THEN zs1 * zhlc[zi] ELSE 0e0 END
+                                   + CASE WHEN zk3 = zj AND zj <> zi
+                                          THEN zs2 * zhlc[zj] ELSE 0e0 END),
+                           y_tbl, exog_tbl, degs_tbl,
+                           r, p, q, bigp, bigq, s, d, sd,
+                           ktrend, conc)).ll AS zfv
+                FROM (
+                    SELECT zh2.zc AS zcc,
                            zh2.zhl AS zhlc, zh2.zf0 AS zf0c,
                            zu1.zi, zu2.zj, (zsg.zst).zs1 AS zs1, (zsg.zst).zs2 AS zs2
                     FROM unnest(range(1, zh2.znp + 1)) AS zu1(zi)

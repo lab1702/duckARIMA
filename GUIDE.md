@@ -230,6 +230,73 @@ All failures raise immediately with a message naming the offender:
 - Missing values: NULL y is supported (see section 5); NULL exog is not
   (statsmodels-parity choice).
 
+### Larger-than-memory mode
+
+The default optimizer uses whole-series ordered `LIST` folds. They make its
+floating-point path bitwise deterministic and are substantially faster for
+the series sizes at which a pure-SQL BFGS fit is normally practical, but
+DuckDB documents `list` aggregate state as a larger-than-memory limitation:
+it is not offloaded through the buffer manager merely because a
+`temp_directory` is set.
+
+Pass `out_of_core := true` to select the alternative relational likelihood.
+That path uses spillable relational preparation and the compact keyed Kalman
+recursion, which retains only the current state for each parameter probe. An
+explicit **unique** `t_col` is mandatory. In particular, do not combine
+`preserve_insertion_order = false` with the implicit `t_col := NULL` order:
+endog and exog are separate scans and unordered SQL results have no stable
+natural order.
+
+The uniqueness check shares the native-type window-sort strategy rather than
+building a whole-key `DISTINCT` aggregate, so that validation can also use the
+temporary directory under a tight memory budget.
+
+Resource limits are DuckDB session settings, not macro arguments. Configure
+them before loading or invoking the fit, and put the spill directory on a
+filesystem with enough free space:
+
+```sql
+SET memory_limit = '8GB';                 -- leave headroom for non-buffer memory
+SET temp_directory = '/fast/local/duckdb-spill';
+SET max_temp_directory_size = '100GB';   -- set explicitly; do not rely on defaults
+SET threads = 4;                          -- fewer threads reduce peak memory
+SET preserve_insertion_order = false;     -- safe here only with unique t_col
+
+CREATE TABLE model AS SELECT * FROM sarimax_fit(
+    'very_large_series', 'y', 1, 1, 1,
+    t_col := 'event_time',
+    out_of_core := true,
+    compute_bse := false);
+```
+
+The out-of-core initializer uses zero trend/exog/ARMA coefficients and the
+spill-safe scalar second moment for sigma2, rather than the default
+Hannan–Rissanen initializer's ordered folds. The relational system builder
+also uses its Lyapunov solve rather than the fast scalar objective's fixed
+doubling approximation. Results should agree to the library's statistical
+tolerances, but the two optimizer paths are not promised bitwise identical;
+use `threads = 1` when run-to-run floating-point repeatability is paramount.
+For `simple_differencing := false` on integrated level data, that raw second
+moment can be a conservative (large) starting variance, so convergence may
+take more iterations than on the default initializer.
+
+For genuinely large fits, `compute_bse := false` is strongly recommended.
+It leaves the model's `bse` values NULL and skips the central-difference
+Hessian, whose O(k_params²) likelihood probes can dominate the fit. This
+does not affect parameters, stored state, evaluation criteria, or forecasts.
+
+Memory-bounded does not mean cheap: every likelihood is still a sequential
+O(n * state_dimension^3) recursion, and BFGS performs many likelihoods.
+Binding and planning the pure-SQL optimizer can also have noticeable fixed
+startup latency before the first data pass.
+At million-row scale a native Kalman extension will usually be operationally
+preferable. The current out-of-core contract covers `sarimax_fit`; residual,
+evaluation, and Ljung–Box queries still retain a full trace or whole-series
+intermediates. DuckDB's
+[`verify_external`](https://duckdb.org/docs/current/configuration/pragmas#verification)
+and JSON profiling metrics (`SYSTEM_PEAK_TEMP_DIR_SIZE`) can be used to prove
+that a deployment exercised external operators.
+
 ## 8. Validating against statsmodels yourself
 
 ```python

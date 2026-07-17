@@ -474,6 +474,48 @@ CROSS JOIN query_table(y_tbl) w
 LEFT JOIN _sarimax_oa2_int di
        ON di.probe_id = pr.probe_id AND di.t = w.t;
 
+-- Out-of-core observation preparation.  The regular kernel above deliberately
+-- uses an ordered LIST fold so its floating-point result is bitwise stable at
+-- every thread count.  A LIST aggregate owns heap memory outside DuckDB's
+-- spillable buffer manager, however, and one aggregate state per
+-- (probe_id, t) is enough to exhaust a constrained-memory run on a large
+-- series.  This variant keeps only a scalar SUM state per group.  It is used
+-- exclusively by the public out_of_core fit path; the ordinary path retains
+-- the exact ordered-fold contract.
+CREATE OR REPLACE MACRO _sarimax_obs_adj_v2_ooc(y_tbl, exog_tbl, probes_tbl,
+                                                r, ktrend, degs_tbl) AS TABLE
+WITH _sarimax_oa2o_args AS (
+    SELECT r::BIGINT AS zr, ktrend::BIGINT AS zkt
+),
+_sarimax_oa2o_degs AS (
+    SELECT coalesce(list(degree::BIGINT ORDER BY idx), []::BIGINT[]) AS degs
+    FROM query_table(degs_tbl)
+),
+_sarimax_oa2o_pr AS (
+    SELECT pr.probe_id,
+           list_slice(pr.params, za.zkt + 1, za.zkt + za.zr) AS beta,
+           list_slice(pr.params, 1, za.zkt) AS tau,
+           dg.degs
+    FROM query_table(probes_tbl) pr, _sarimax_oa2o_args za, _sarimax_oa2o_degs dg
+),
+_sarimax_oa2o_int AS (
+    SELECT pr.probe_id, e.t,
+           CASE WHEN count(e.x) = count(*)
+                THEN sum(e.x * pr.beta[e.j])
+                ELSE error('sarimax: exog contains NULL values') END AS d
+    FROM _sarimax_oa2o_pr pr
+    CROSS JOIN query_table(exog_tbl) e
+    GROUP BY pr.probe_id, e.t
+)
+SELECT pr.probe_id, w.t,
+       w.y - coalesce(di.d, 0e0) AS yd,
+       CASE WHEN len(pr.tau) = 0 THEN 0e0
+            ELSE (_sarimax_trend_c(pr.degs, pr.tau, w.t, 1))[1] END AS ct
+FROM _sarimax_oa2o_pr pr
+CROSS JOIN query_table(y_tbl) w
+LEFT JOIN _sarimax_oa2o_int di
+       ON di.probe_id = pr.probe_id AND di.t = w.t;
+
 -- ---- the v2 filter --------------------------------------------------------------
 
 -- obs_tbl: (probe_id, t, yd, ct), t dense 1..n per probe (yd NULL = missing).

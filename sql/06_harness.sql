@@ -188,14 +188,33 @@ CREATE OR REPLACE MACRO _sarimax_validate_spec(p, d, q, sp, sd, sq, s) AS (
 
 -- ---- internal: series / exog extraction from a user table ----------------------
 
--- (t, y) with t = 1..n by t_col order (or natural order when t_col is NULL).
+-- Native-key ordering plus a duplicate/NULL-time flag.  Window sorting is an
+-- externalizable DuckDB operator; count(DISTINCT key) is deliberately avoided
+-- because its aggregate state can exhaust a constrained memory_limit.
 -- struct_extract requires a CONSTANT key, hence the coalesce guard: when
 -- t_col is NULL the CASE never reads the extracted value, but the branch must
 -- still bind against a valid constant column name.
+CREATE OR REPLACE MACRO _sarimax_series_checked_of(data, y_col, t_col) AS TABLE
+WITH _sarimax_sco_keyed AS (
+    SELECT CASE WHEN t_col IS NULL THEN NULL
+                ELSE struct_extract(zd, coalesce(t_col, y_col)) END AS zkey,
+           struct_extract(zd, y_col)::DOUBLE AS y
+    FROM query_table(data) zd
+),
+_sarimax_sco_ordered AS (
+    SELECT row_number() OVER (ORDER BY zkey) AS t,
+           y, zkey, lag(zkey) OVER (ORDER BY zkey) AS zprev
+    FROM _sarimax_sco_keyed
+)
+SELECT t, y,
+       (zkey IS NULL OR zkey IS NOT DISTINCT FROM zprev) AS invalid_time
+FROM _sarimax_sco_ordered;
+
+-- (t, y) with t = 1..n by t_col order (or natural order when t_col is NULL).
 CREATE OR REPLACE MACRO _sarimax_series_of(data, y_col, t_col) AS TABLE
 SELECT row_number() OVER (
-           ORDER BY CASE WHEN t_col IS NULL THEN 0e0
-                         ELSE struct_extract(zd, coalesce(t_col, y_col))::DOUBLE END) AS t,
+           ORDER BY CASE WHEN t_col IS NULL THEN NULL
+                         ELSE struct_extract(zd, coalesce(t_col, y_col)) END) AS t,
        struct_extract(zd, y_col)::DOUBLE AS y
 FROM query_table(data) zd;
 
@@ -246,8 +265,8 @@ CREATE OR REPLACE MACRO _sarimax_exog_of(data, exog_cols, y_col, t_col) AS TABLE
 SELECT zs.t, zc.j::INT AS j, _sarimax_exog_x(zs.zd, exog_cols, y_col, zc.j) AS x
 FROM (
     SELECT row_number() OVER (
-               ORDER BY CASE WHEN t_col IS NULL THEN 0e0
-                             ELSE struct_extract(zd, coalesce(t_col, y_col))::DOUBLE END) AS t,
+               ORDER BY CASE WHEN t_col IS NULL THEN NULL
+                             ELSE struct_extract(zd, coalesce(t_col, y_col)) END) AS t,
            zd
     FROM query_table(data) zd
 ) zs
@@ -454,13 +473,43 @@ CREATE OR REPLACE MACRO sarimax_fit(data, y_col, p, d, q,
                                     sp := 0, sd := 0, sq := 0, s := 1,
                                     exog_cols := []::VARCHAR[], t_col := NULL,
                                     trend := 'n', concentrate := false,
-                                    simple_differencing := true) AS TABLE
-WITH _sarimax_f_series AS (
-    SELECT t, y FROM _sarimax_series_of(data, y_col, t_col)
+                                    simple_differencing := true,
+                                    out_of_core := false,
+                                    compute_bse := true) AS TABLE
+WITH _sarimax_f_ordered AS MATERIALIZED (
+    SELECT t, y, false AS invalid_time
+    FROM _sarimax_series_of(data, y_col, t_col)
+    WHERE NOT out_of_core
+    UNION ALL
+    SELECT t, y, invalid_time
+    FROM _sarimax_series_checked_of(data, y_col, t_col)
+    WHERE out_of_core
 ),
-_sarimax_f_chk AS (
+_sarimax_f_series AS MATERIALIZED (
+    SELECT t, y FROM _sarimax_f_ordered
+),
+_sarimax_f_exog AS MATERIALIZED (
+    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
+),
+_sarimax_f_chk AS MATERIALIZED (
     SELECT _sarimax_validate_spec(p, d, q, sp, sd, sq, s)
            AND _sarimax_validate_trend(trend)
+           AND CASE
+                 WHEN out_of_core AND t_col IS NULL
+                   THEN error('sarimax: out_of_core requires an explicit unique t_col')
+                 WHEN out_of_core AND t_col IS NOT NULL AND
+                      (SELECT coalesce(bool_or(invalid_time), false)
+                       FROM _sarimax_f_ordered)
+                   THEN error('sarimax: out_of_core requires t_col to be unique')
+                 ELSE true
+               END
+           AND CASE
+                 WHEN out_of_core AND
+                      (SELECT count(*) FILTER (WHERE x IS NULL) > 0
+                       FROM _sarimax_f_exog)
+                   THEN error('sarimax: exog contains NULL values')
+                 ELSE true
+               END
            AND (SELECT CASE
                          WHEN count(*) = 0 THEN error('sarimax: input series is empty')
                          WHEN count(y) = 0
@@ -468,42 +517,46 @@ _sarimax_f_chk AS (
                          ELSE true END
                 FROM _sarimax_f_series) AS ok
 ),
-_sarimax_f_exog AS (
-    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
-),
 -- model-scale series: differenced up front when simple_differencing (the
 -- NULL-tolerant staged variant: bit-identical to v1 on complete data, NULL y
 -- propagates), the RAW series otherwise. Literal WHERE gates constant-fold.
-_sarimax_f_y AS (
-    SELECT t, w AS y FROM _sarimax_diff_nt('_sarimax_f_series', 't', 'y', d, sd, s)
-    WHERE simple_differencing
+_sarimax_f_y AS MATERIALIZED (
+    SELECT t, w AS y
+    FROM _sarimax_diff_nt('_sarimax_f_series', 't', 'y', d, sd, s),
+         _sarimax_f_chk
+    WHERE simple_differencing AND ok
     UNION ALL
-    SELECT t, y FROM _sarimax_f_series
-    WHERE NOT simple_differencing
+    SELECT t, y
+    FROM _sarimax_f_series, _sarimax_f_chk
+    WHERE NOT simple_differencing AND ok
 ),
-_sarimax_f_exd AS (
-    SELECT t, j, x FROM _sarimax_diff_exog('_sarimax_f_exog', d, sd, s)
-    WHERE simple_differencing
+_sarimax_f_exd AS MATERIALIZED (
+    SELECT t, j, x
+    FROM _sarimax_diff_exog('_sarimax_f_exog', d, sd, s),
+         _sarimax_f_chk
+    WHERE simple_differencing AND ok
     UNION ALL
-    SELECT t, j, x FROM _sarimax_f_exog
-    WHERE NOT simple_differencing
+    SELECT t, j, x
+    FROM _sarimax_f_exog, _sarimax_f_chk
+    WHERE NOT simple_differencing AND ok
 ),
 _sarimax_f_degs AS (
     SELECT unnest(range(1, len(_sarimax_trend_degrees(trend)) + 1))::BIGINT AS idx,
            unnest(_sarimax_trend_degrees(trend))::BIGINT AS degree
 ),
-_sarimax_f_fit AS (
+_sarimax_f_fit AS MATERIALIZED (
     SELECT * FROM _sarimax_bfgs_v2('_sarimax_f_y', '_sarimax_f_exd', '_sarimax_f_degs',
                                    len(exog_cols), p, q, sp, sq, greatest(s, 1),
                                    CASE WHEN simple_differencing THEN 0 ELSE d END,
                                    CASE WHEN simple_differencing THEN 0 ELSE sd END,
-                                   len(_sarimax_trend_degrees(trend)), concentrate)
+                                   len(_sarimax_trend_degrees(trend)), concentrate,
+                                   out_of_core)
 ),
 _sarimax_f_dims AS (
     SELECT len(exog_cols)::INT AS r,
            len(_sarimax_trend_degrees(trend))::INT AS ktrend,
-           (SELECT count(*) FROM _sarimax_f_series)::INT AS n,
-           (SELECT count(*) FROM _sarimax_f_y)::INT AS n_eff,
+           (SELECT count(*) FROM _sarimax_f_series)::BIGINT AS n,
+           (SELECT count(*) FROM _sarimax_f_y)::BIGINT AS n_eff,
            (CASE WHEN simple_differencing THEN 0 ELSE d + greatest(s, 1) * sd END)::INT AS burn,
            -- reported parameter count (sigma2 dropped when concentrated) ...
            (len(_sarimax_trend_degrees(trend)) + len(exog_cols) + p + q + sp + sq
@@ -529,6 +582,13 @@ _sarimax_f_obs AS (
     SELECT * FROM _sarimax_obs_adj_v2('_sarimax_f_y', '_sarimax_f_exd', '_sarimax_f_probe',
                                       len(exog_cols), len(_sarimax_trend_degrees(trend)),
                                       '_sarimax_f_degs')
+    WHERE NOT out_of_core
+    UNION ALL
+    SELECT * FROM _sarimax_obs_adj_v2_ooc('_sarimax_f_y', '_sarimax_f_exd',
+                                          '_sarimax_f_probe', len(exog_cols),
+                                          len(_sarimax_trend_degrees(trend)),
+                                          '_sarimax_f_degs')
+    WHERE out_of_core
 ),
 _sarimax_f_state AS (
     SELECT * FROM _sarimax_kfilter_state_v2('_sarimax_f_obs', '_sarimax_f_sys')
@@ -541,8 +601,9 @@ _sarimax_f_lists AS (
                               FROM (SELECT t AS zt, list(x ORDER BY j) AS zxr
                                     FROM _sarimax_f_exd GROUP BY t))
                    END) AS xmat,
-           (SELECT coalesce(list(degree ORDER BY idx), []::BIGINT[])
-            FROM _sarimax_f_degs) AS degs
+            (SELECT coalesce(list(degree ORDER BY idx), []::BIGINT[])
+             FROM _sarimax_f_degs) AS degs
+    WHERE NOT out_of_core AND compute_bse
 ),
 _sarimax_f_bse AS (
     SELECT bse FROM _sarimax_bse_v2(
@@ -554,6 +615,19 @@ _sarimax_f_bse AS (
         CASE WHEN simple_differencing THEN 0 ELSE d END,
         CASE WHEN simple_differencing THEN 0 ELSE sd END,
         len(_sarimax_trend_degrees(trend)), concentrate)
+    WHERE NOT out_of_core AND compute_bse
+    UNION ALL
+    SELECT bse FROM _sarimax_bse_ooc_v2(
+        (SELECT params FROM _sarimax_f_fit),
+        '_sarimax_f_y', '_sarimax_f_exd', '_sarimax_f_degs',
+        len(exog_cols), p, q, sp, sq, greatest(s, 1),
+        CASE WHEN simple_differencing THEN 0 ELSE d END,
+        CASE WHEN simple_differencing THEN 0 ELSE sd END,
+        len(_sarimax_trend_degrees(trend)), concentrate)
+    WHERE out_of_core AND compute_bse
+    UNION ALL
+    SELECT list_transform((SELECT params FROM _sarimax_f_fit), lambda zp: NULL::DOUBLE)
+    WHERE NOT compute_bse
 ),
 _sarimax_f_names AS (
     SELECT list_transform(range(1, dm.k_params + 1), lambda zi:

@@ -20,6 +20,7 @@ python -m venv .venv && .venv/Scripts/pip install -r tests/requirements.txt
 | `test_forecast.py` | `sql/05_forecast.sql` | **Tier 3**: forecasts both scales rel<=1e-6, standard errors rel<=1e-5, h=1..36 |
 | `test_assembly.py` | `sarimax_macros.sql` | shipped file == tools/build_macros.py output; loads clean; public macros callable |
 | `test_harness.py` | `sql/06_harness.sql` | exog column dispatch up to the 32-column cap, named failure beyond it; **v2 end-to-end**: public fit/forecast/summary/residuals/ljungbox vs `fixtures_v2` (trend, concentrated scale, missing y, simple_differencing=False) under the Tier-2 re-baselining acceptance; v1 public-path regression through the new engine (default flags == v1 behavior) |
+| `test_out_of_core.py` | relational fit path | native time-key ordering, scalar-vs-relational likelihood and Hessian parity paths, explicit unique-time/NULL-exog validation, public `out_of_core` fit without Hessian, a 20 MB keyed-filter regression, and profiled external spill where the input-sized `LIST` path fails |
 | `test_live.py` | all layers | **live cross-check**: references recomputed against statsmodels in-process on fixed-seed data at fixed parameters (transform, ssm, filter trace, loglik, forecasts both scales) — guards against environment drift independently of the frozen fixtures |
 
 ## 2. The pure-SQL smoke path (no Python)
