@@ -1,0 +1,10 @@
+# Pinned reference environment for fixture generation and the pytest validation path.
+# Fixtures are NEVER regenerated silently (see tests/README.md); if these pins move,
+# the fixtures must be deliberately regenerated and the change documented.
+statsmodels==0.14.6
+numpy==2.5.1
+pandas==3.0.3
+pyarrow==25.0.0
+scipy==1.18.0
+duckdb==1.5.4
+pytest>=8
