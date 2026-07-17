@@ -178,3 +178,128 @@ UNION ALL
 SELECT 'state_cov', 1, 1, sigma2 FROM _sarimax_mats
 UNION ALL
 SELECT 'obs_cov', 1, 1, 0.0::DOUBLE FROM _sarimax_mats;
+
+
+-- ============================================================================
+-- SECTION 2 (v2, appended): augmented state space for simple_differencing =
+-- FALSE, trend terms, and concentrated scale. The v1 macros above are frozen;
+-- everything below is new. Derived from statsmodels 0.14.6
+-- statsmodels/tsa/statespace/sarimax.py (initial_design / initial_transition /
+-- initial_selection / update) and pinned by tests/fixtures_v2 ssm.parquet.
+--
+-- Augmented layout (1-based state indices), kdiff = d + s*sd, k = kdiff+karma:
+--   states 1..d                : ordinary-differencing integrators
+--   states d+1 .. d+sd*s       : sd seasonal cycle blocks of length s
+--   states kdiff+1 .. k        : the v1 Harvey ARMA block (karma states)
+--
+--   design Z:      1 at i <= d; 1 at the LAST state of each seasonal cycle
+--                  block (i = d + g*s, g = 1..sd); 1 at i = kdiff+1.
+--   transition T:  rows 1..d      upper triangle of the d x d block = 1,
+--                                 1 at the last column of each seasonal block,
+--                                 1 at column kdiff+1;
+--                  seasonal block g (rows d+g*s+1 .. d+(g+1)*s, g 0-based):
+--                                 first row: 1 at its own last column
+--                                 (d+(g+1)*s), 1 at the NEXT block's last
+--                                 column (d+(g+2)*s, only when g < sd-1),
+--                                 1 at column kdiff+1; rows 2..s: in-block
+--                                 subdiagonal T[i, i-1] = 1;
+--                  rows kdiff+1..k: v1 companion (_sarimax_build_t) shifted.
+--   selection R:   zeros(kdiff) ++ v1 (1, theta*_1, ...).
+--   trend:         state intercept c_t = sum_g tau_g * t**deg_g enters ONLY
+--                  row cidx = kdiff+1 (t = 1..n, 1-based, trend_offset = 1).
+--   init:          P1 = blockdiag(1e6 * I_kdiff, lyapunov(T_arma, RQR_arma)),
+--                  a1 = zeros ++ (I - T_arma)^-1 e_1 c_1.
+--   concentrated:  sigma2 = 1 in RQR; params carry no sigma2 slot.
+--
+-- Lambda-arg discipline: every argument of the scalar builders below is
+-- referenced inside a lambda body -- callers must pass plain column
+-- references or literals (bind expressions in a prior CTE), per the
+-- composition caveat in sql/00_linalg.sql.
+-- ============================================================================
+
+-- kdiff = d + s*sd, the number of prepended differencing states.
+CREATE OR REPLACE MACRO _sarimax_kdiff(d, sd, s) AS (
+    (d + s * sd)::BIGINT
+);
+
+-- Design row Z (k-list) of the augmented system.
+CREATE OR REPLACE MACRO _sarimax_build_z_v2(karma, d, sd, s) AS (
+    list_transform(range(1, d + s * sd + karma + 1), lambda zi:
+        CASE WHEN zi <= d THEN 1e0
+             WHEN zi <= d + s * sd AND (zi - d) % greatest(s, 1) = 0 THEN 1e0
+             WHEN zi = d + s * sd + 1 THEN 1e0
+             ELSE 0e0 END)
+);
+
+-- Augmented transition T (k*k flattened row-major). phistar is the reduced
+-- AR tail from _sarimax_expand_ar; the trailing karma block is exactly
+-- _sarimax_build_t(phistar, karma).
+CREATE OR REPLACE MACRO _sarimax_build_t_v2(phistar, karma, d, sd, s) AS (
+    list_transform(range(1, (d + s * sd + karma) * (d + s * sd + karma) + 1),
+        lambda zidx:
+        (list_transform([struct_pack(
+             zi := (zidx - 1) // (d + s * sd + karma) + 1,
+             zj := (zidx - 1) % (d + s * sd + karma) + 1,
+             zkd := d + s * sd)], lambda zc:
+           CASE
+             -- ordinary-differencing rows
+             WHEN zc.zi <= d THEN
+               CASE WHEN zc.zj <= d AND zc.zj >= zc.zi THEN 1e0
+                    WHEN zc.zj > d AND zc.zj <= zc.zkd
+                         AND (zc.zj - d) % greatest(s, 1) = 0 THEN 1e0
+                    WHEN zc.zj = zc.zkd + 1 THEN 1e0
+                    ELSE 0e0 END
+             -- seasonal-differencing blocks
+             WHEN zc.zi <= zc.zkd THEN
+               CASE
+                 -- rows 2..s of a block: in-block subdiagonal
+                 WHEN (zc.zi - d - 1) % greatest(s, 1) <> 0 THEN
+                   CASE WHEN zc.zj = zc.zi - 1 THEN 1e0 ELSE 0e0 END
+                 -- first row of block g: own last column, next block's last
+                 -- column (chain), and the first ARMA state (iota)
+                 ELSE
+                   CASE WHEN zc.zj = zc.zi - 1 + s THEN 1e0
+                        WHEN zc.zj = zc.zi - 1 + 2 * s AND zc.zj <= zc.zkd
+                             THEN 1e0
+                        WHEN zc.zj = zc.zkd + 1 THEN 1e0
+                        ELSE 0e0 END
+               END
+             -- ARMA companion block (v1 _sarimax_build_t, shifted)
+             ELSE
+               CASE WHEN zc.zj <= zc.zkd THEN 0e0
+                    ELSE (CASE WHEN zc.zj - zc.zkd = 1
+                                    AND zc.zi - zc.zkd <= len(phistar)
+                               THEN phistar[zc.zi - zc.zkd] ELSE 0e0 END)
+                         + (CASE WHEN zc.zj - zc.zkd = zc.zi - zc.zkd + 1
+                                 THEN 1e0 ELSE 0e0 END)
+               END
+           END))[1])
+);
+
+-- Augmented selection R (k-list): zeros(kdiff) ++ v1 (1, theta*_1, ...).
+CREATE OR REPLACE MACRO _sarimax_build_r_v2(thetastar, karma, d, sd, s) AS (
+    list_transform(range(1, d + s * sd + karma + 1), lambda zi:
+        CASE WHEN zi <= d + s * sd THEN 0e0
+             WHEN zi = d + s * sd + 1 THEN 1e0
+             WHEN zi - (d + s * sd) - 1 <= len(thetastar)
+                  THEN thetastar[zi - (d + s * sd) - 1]
+             ELSE 0e0 END)
+);
+
+-- NOTE: the v2 initialization builders _sarimax_p1_v2 and _sarimax_a1_v2
+-- live in sql/03_filter.sql -- they depend on Layer 0 (_sarimax_lyap,
+-- _sarimax_solve_list), and this file must keep loading STANDALONE (the v1
+-- Layer-2 acceptance tests load 02_ssm.sql without 00_linalg.sql; DuckDB
+-- binds macro bodies at CREATE time).
+
+-- Trend state-intercept values c_t = sum_g tau_g * t**deg_g for
+-- t = tstart .. tstart + nsteps - 1 (ordered fold over degrees ascending).
+-- degs: BIGINT[] of 0-based polynomial degrees; tau: DOUBLE[] same length;
+-- empty degs -> zeros.
+CREATE OR REPLACE MACRO _sarimax_trend_c(degs, tau, tstart, nsteps) AS (
+    list_transform(range(1, nsteps + 1), lambda zt:
+        list_reduce(
+            list_prepend(0e0, list_transform(range(1, len(degs) + 1),
+                lambda zg: tau[zg] * pow((tstart + zt - 1)::DOUBLE, degs[zg]))),
+            lambda zacc, zterm: zacc + zterm))
+);
