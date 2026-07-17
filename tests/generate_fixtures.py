@@ -228,7 +228,8 @@ def ssm_rows(model, params, probe_id):
     model.update(np.asarray(params), transformed=True)
     rows = []
     def emit(name, arr):
-        arr = np.atleast_2d(np.squeeze(np.asarray(arr, dtype=float)))
+        arr = np.asarray(arr, dtype=float)
+        assert arr.ndim == 2, (name, arr.shape)
         for i in range(arr.shape[0]):
             for j in range(arr.shape[1]):
                 rows.append((probe_id, name, i + 1, j + 1, float(arr[i, j])))
