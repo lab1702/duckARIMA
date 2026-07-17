@@ -20,8 +20,9 @@ FIXTURES = sorted(
 def con():
     c = duckdb.connect()
     c.execute("SET lambda_syntax = 'DISABLE_SINGLE_ARROW'")
-    with open(os.path.join(ROOT, "sql", "04_estimate.sql")) as f:
-        c.execute(f.read())
+    for name in ["00_linalg.sql", "02_ssm.sql", "03_filter.sql", "04_estimate.sql"]:
+        with open(os.path.join(ROOT, "sql", name)) as f:
+            c.execute(f.read())
     return c
 
 
