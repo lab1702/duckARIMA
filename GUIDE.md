@@ -92,7 +92,7 @@ behavior", recorded here so nothing is implicit in code:
     regressor column names again as a literal list (struct-field access in
     DuckDB requires constant keys, so names stored in the model table cannot
     drive extraction); the list is validated against the stored names. At
-    most 12 exogenous columns are supported.
+    most 32 exogenous columns are supported.
 12. **Grid search**: `sarimax_grid_sql(data, y_col, orders)` returns the SQL
     text that fits every row of the orders table and ranks by AIC (DuckDB
     cannot correlate table-macro arguments through a lateral join, so the

@@ -63,7 +63,7 @@ correlate table-macro arguments through a lateral join; duckLM's
 ---
 
 Notes: diagnostics/forecast macros need `exog_cols` re-supplied for exog
-models; at most 12 exogenous columns (constant-key dispatch cap).
+models; at most 32 exogenous columns (constant-key dispatch cap).
 
 Everything prefixed `_sarimax_` is internal. Column and table names beginning
 with `_sarimax_` are reserved.

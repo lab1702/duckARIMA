@@ -3435,22 +3435,43 @@ FROM query_table(data) zd;
 -- Long-form exog (t, j, x) from named columns; zero rows when the list is
 -- empty. struct_extract keys must be constants, so the column dispatch is a
 -- CASE over constant list positions -- which caps the supported number of
--- regressors at 12 (documented; raise by extending the CASE).
+-- regressors at 32 (documented; raise by extending the CASE, see
+-- tools/gen_exog_dispatch note in the repo history).
 CREATE OR REPLACE MACRO _sarimax_exog_x(zd, exog_cols, y_col, zj) AS (
     CASE zj
-        WHEN 1  THEN struct_extract(zd, coalesce(exog_cols[1]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 2  THEN struct_extract(zd, coalesce(exog_cols[2]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 3  THEN struct_extract(zd, coalesce(exog_cols[3]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 4  THEN struct_extract(zd, coalesce(exog_cols[4]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 5  THEN struct_extract(zd, coalesce(exog_cols[5]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 6  THEN struct_extract(zd, coalesce(exog_cols[6]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 7  THEN struct_extract(zd, coalesce(exog_cols[7]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 8  THEN struct_extract(zd, coalesce(exog_cols[8]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 9  THEN struct_extract(zd, coalesce(exog_cols[9]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 10 THEN struct_extract(zd, coalesce(exog_cols[10]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 11 THEN struct_extract(zd, coalesce(exog_cols[11]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        WHEN 12 THEN struct_extract(zd, coalesce(exog_cols[12]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
-        ELSE error('sarimax: at most 12 exogenous columns are supported')
+        WHEN 1  THEN struct_extract(zd, coalesce(exog_cols[1]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 2  THEN struct_extract(zd, coalesce(exog_cols[2]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 3  THEN struct_extract(zd, coalesce(exog_cols[3]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 4  THEN struct_extract(zd, coalesce(exog_cols[4]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 5  THEN struct_extract(zd, coalesce(exog_cols[5]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 6  THEN struct_extract(zd, coalesce(exog_cols[6]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 7  THEN struct_extract(zd, coalesce(exog_cols[7]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 8  THEN struct_extract(zd, coalesce(exog_cols[8]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 9  THEN struct_extract(zd, coalesce(exog_cols[9]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 10 THEN struct_extract(zd, coalesce(exog_cols[10]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 11 THEN struct_extract(zd, coalesce(exog_cols[11]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 12 THEN struct_extract(zd, coalesce(exog_cols[12]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 13 THEN struct_extract(zd, coalesce(exog_cols[13]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 14 THEN struct_extract(zd, coalesce(exog_cols[14]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 15 THEN struct_extract(zd, coalesce(exog_cols[15]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 16 THEN struct_extract(zd, coalesce(exog_cols[16]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 17 THEN struct_extract(zd, coalesce(exog_cols[17]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 18 THEN struct_extract(zd, coalesce(exog_cols[18]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 19 THEN struct_extract(zd, coalesce(exog_cols[19]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 20 THEN struct_extract(zd, coalesce(exog_cols[20]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 21 THEN struct_extract(zd, coalesce(exog_cols[21]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 22 THEN struct_extract(zd, coalesce(exog_cols[22]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 23 THEN struct_extract(zd, coalesce(exog_cols[23]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 24 THEN struct_extract(zd, coalesce(exog_cols[24]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 25 THEN struct_extract(zd, coalesce(exog_cols[25]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 26 THEN struct_extract(zd, coalesce(exog_cols[26]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 27 THEN struct_extract(zd, coalesce(exog_cols[27]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 28 THEN struct_extract(zd, coalesce(exog_cols[28]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 29 THEN struct_extract(zd, coalesce(exog_cols[29]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 30 THEN struct_extract(zd, coalesce(exog_cols[30]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 31 THEN struct_extract(zd, coalesce(exog_cols[31]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 32 THEN struct_extract(zd, coalesce(exog_cols[32]::VARCHAR,  exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        ELSE error('sarimax: at most 32 exogenous columns are supported')
     END
 );
 
