@@ -39,6 +39,20 @@ SELECT * FROM sarimax_forecast('m', 'sales', 'units', 12,
 SELECT * FROM sarimax_evaluate('m', 'sales', 'units');          -- loglik, AIC, BIC, sigma2
 ```
 
+Beyond the basics, `sarimax_fit` supports trend terms (`trend := 'c' | 't' |
+'ct'`, statsmodels' `intercept`/`drift` parameters), a concentrated scale
+(`concentrate := true`: sigma2 solved analytically, one fewer optimizer
+dimension), missing values in the target (NULL `y` is filtered over, not
+rejected), and exact full-sample estimation without up-front differencing
+(`simple_differencing := false`, statsmodels' default formulation — no
+observations lost to differencing):
+
+```sql
+CREATE TABLE m2 AS SELECT * FROM sarimax_fit('sales', 'units', 1, 1, 1,
+                                             trend := 'ct', concentrate := true,
+                                             simple_differencing := false);
+```
+
 Note: the seasonal orders are `sp` (seasonal AR), `sd` (seasonal
 differencing), `sq` (seasonal MA) — DuckDB macro parameters are
 case-insensitive, so the textbook `P/D/Q` names would collide with `p/d/q`.
@@ -58,8 +72,10 @@ seasonal_order=(sp,sd,sq,s))`.
 ## Validation
 
 Two independent paths (see `tests/README.md`): `pytest tests/ -q` runs the
-tiered statsmodels comparison on 11 committed fixtures (ARMA/ARIMA/SARIMA/
-ARIMAX/SARIMAX, including near-boundary cases and the airline benchmark), and
+tiered statsmodels comparison on 11 committed v1 fixtures (ARMA/ARIMA/SARIMA/
+ARIMAX/SARIMAX, including near-boundary cases and the airline benchmark) plus
+6 v2 fixtures (trend, concentrated scale, missing values, no simple
+differencing — including a kitchen-sink model combining all four), and
 `duckdb < tests/smoke.sql` fits and forecasts with no Python at all.
 
 MIT licensed.

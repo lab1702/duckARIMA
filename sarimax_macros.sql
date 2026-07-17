@@ -1504,6 +1504,131 @@ UNION ALL
 SELECT 'obs_cov', 1, 1, 0.0::DOUBLE FROM _sarimax_mats;
 
 
+-- ============================================================================
+-- SECTION 2 (v2, appended): augmented state space for simple_differencing =
+-- FALSE, trend terms, and concentrated scale. The v1 macros above are frozen;
+-- everything below is new. Derived from statsmodels 0.14.6
+-- statsmodels/tsa/statespace/sarimax.py (initial_design / initial_transition /
+-- initial_selection / update) and pinned by tests/fixtures_v2 ssm.parquet.
+--
+-- Augmented layout (1-based state indices), kdiff = d + s*sd, k = kdiff+karma:
+--   states 1..d                : ordinary-differencing integrators
+--   states d+1 .. d+sd*s       : sd seasonal cycle blocks of length s
+--   states kdiff+1 .. k        : the v1 Harvey ARMA block (karma states)
+--
+--   design Z:      1 at i <= d; 1 at the LAST state of each seasonal cycle
+--                  block (i = d + g*s, g = 1..sd); 1 at i = kdiff+1.
+--   transition T:  rows 1..d      upper triangle of the d x d block = 1,
+--                                 1 at the last column of each seasonal block,
+--                                 1 at column kdiff+1;
+--                  seasonal block g (rows d+g*s+1 .. d+(g+1)*s, g 0-based):
+--                                 first row: 1 at its own last column
+--                                 (d+(g+1)*s), 1 at the NEXT block's last
+--                                 column (d+(g+2)*s, only when g < sd-1),
+--                                 1 at column kdiff+1; rows 2..s: in-block
+--                                 subdiagonal T[i, i-1] = 1;
+--                  rows kdiff+1..k: v1 companion (_sarimax_build_t) shifted.
+--   selection R:   zeros(kdiff) ++ v1 (1, theta*_1, ...).
+--   trend:         state intercept c_t = sum_g tau_g * t**deg_g enters ONLY
+--                  row cidx = kdiff+1 (t = 1..n, 1-based, trend_offset = 1).
+--   init:          P1 = blockdiag(1e6 * I_kdiff, lyapunov(T_arma, RQR_arma)),
+--                  a1 = zeros ++ (I - T_arma)^-1 e_1 c_1.
+--   concentrated:  sigma2 = 1 in RQR; params carry no sigma2 slot.
+--
+-- Lambda-arg discipline: every argument of the scalar builders below is
+-- referenced inside a lambda body -- callers must pass plain column
+-- references or literals (bind expressions in a prior CTE), per the
+-- composition caveat in sql/00_linalg.sql.
+-- ============================================================================
+
+-- kdiff = d + s*sd, the number of prepended differencing states.
+CREATE OR REPLACE MACRO _sarimax_kdiff(d, sd, s) AS (
+    (d + s * sd)::BIGINT
+);
+
+-- Design row Z (k-list) of the augmented system.
+CREATE OR REPLACE MACRO _sarimax_build_z_v2(karma, d, sd, s) AS (
+    list_transform(range(1, d + s * sd + karma + 1), lambda zi:
+        CASE WHEN zi <= d THEN 1e0
+             WHEN zi <= d + s * sd AND (zi - d) % greatest(s, 1) = 0 THEN 1e0
+             WHEN zi = d + s * sd + 1 THEN 1e0
+             ELSE 0e0 END)
+);
+
+-- Augmented transition T (k*k flattened row-major). phistar is the reduced
+-- AR tail from _sarimax_expand_ar; the trailing karma block is exactly
+-- _sarimax_build_t(phistar, karma).
+CREATE OR REPLACE MACRO _sarimax_build_t_v2(phistar, karma, d, sd, s) AS (
+    list_transform(range(1, (d + s * sd + karma) * (d + s * sd + karma) + 1),
+        lambda zidx:
+        (list_transform([struct_pack(
+             zi := (zidx - 1) // (d + s * sd + karma) + 1,
+             zj := (zidx - 1) % (d + s * sd + karma) + 1,
+             zkd := d + s * sd)], lambda zc:
+           CASE
+             -- ordinary-differencing rows
+             WHEN zc.zi <= d THEN
+               CASE WHEN zc.zj <= d AND zc.zj >= zc.zi THEN 1e0
+                    WHEN zc.zj > d AND zc.zj <= zc.zkd
+                         AND (zc.zj - d) % greatest(s, 1) = 0 THEN 1e0
+                    WHEN zc.zj = zc.zkd + 1 THEN 1e0
+                    ELSE 0e0 END
+             -- seasonal-differencing blocks
+             WHEN zc.zi <= zc.zkd THEN
+               CASE
+                 -- rows 2..s of a block: in-block subdiagonal
+                 WHEN (zc.zi - d - 1) % greatest(s, 1) <> 0 THEN
+                   CASE WHEN zc.zj = zc.zi - 1 THEN 1e0 ELSE 0e0 END
+                 -- first row of block g: own last column, next block's last
+                 -- column (chain), and the first ARMA state (iota)
+                 ELSE
+                   CASE WHEN zc.zj = zc.zi - 1 + s THEN 1e0
+                        WHEN zc.zj = zc.zi - 1 + 2 * s AND zc.zj <= zc.zkd
+                             THEN 1e0
+                        WHEN zc.zj = zc.zkd + 1 THEN 1e0
+                        ELSE 0e0 END
+               END
+             -- ARMA companion block (v1 _sarimax_build_t, shifted)
+             ELSE
+               CASE WHEN zc.zj <= zc.zkd THEN 0e0
+                    ELSE (CASE WHEN zc.zj - zc.zkd = 1
+                                    AND zc.zi - zc.zkd <= len(phistar)
+                               THEN phistar[zc.zi - zc.zkd] ELSE 0e0 END)
+                         + (CASE WHEN zc.zj - zc.zkd = zc.zi - zc.zkd + 1
+                                 THEN 1e0 ELSE 0e0 END)
+               END
+           END))[1])
+);
+
+-- Augmented selection R (k-list): zeros(kdiff) ++ v1 (1, theta*_1, ...).
+CREATE OR REPLACE MACRO _sarimax_build_r_v2(thetastar, karma, d, sd, s) AS (
+    list_transform(range(1, d + s * sd + karma + 1), lambda zi:
+        CASE WHEN zi <= d + s * sd THEN 0e0
+             WHEN zi = d + s * sd + 1 THEN 1e0
+             WHEN zi - (d + s * sd) - 1 <= len(thetastar)
+                  THEN thetastar[zi - (d + s * sd) - 1]
+             ELSE 0e0 END)
+);
+
+-- NOTE: the v2 initialization builders _sarimax_p1_v2 and _sarimax_a1_v2
+-- live in sql/03_filter.sql -- they depend on Layer 0 (_sarimax_lyap,
+-- _sarimax_solve_list), and this file must keep loading STANDALONE (the v1
+-- Layer-2 acceptance tests load 02_ssm.sql without 00_linalg.sql; DuckDB
+-- binds macro bodies at CREATE time).
+
+-- Trend state-intercept values c_t = sum_g tau_g * t**deg_g for
+-- t = tstart .. tstart + nsteps - 1 (ordered fold over degrees ascending).
+-- degs: BIGINT[] of 0-based polynomial degrees; tau: DOUBLE[] same length;
+-- empty degs -> zeros.
+CREATE OR REPLACE MACRO _sarimax_trend_c(degs, tau, tstart, nsteps) AS (
+    list_transform(range(1, nsteps + 1), lambda zt:
+        list_reduce(
+            list_prepend(0e0, list_transform(range(1, len(degs) + 1),
+                lambda zg: tau[zg] * pow((tstart + zt - 1)::DOUBLE, degs[zg]))),
+            lambda zacc, zterm: zacc + zterm))
+);
+
+
 -- ================== sql/03_filter.sql ==================
 
 -- ============================================================================
@@ -1736,6 +1861,433 @@ FROM _sarimax_kfs;
 CREATE OR REPLACE MACRO _sarimax_loglik(obs_tbl, sys_tbl) AS TABLE
 SELECT probe_id, n_eff, loglik
 FROM _sarimax_kfilter_state(obs_tbl, sys_tbl);
+
+
+-- ============================================================================
+-- SECTION 2 (v2, appended): filtering for the AUGMENTED system
+-- (simple_differencing = FALSE) with missing values, trend terms and
+-- concentrated scale. The v1 macros above are frozen.
+--
+-- THE SHIFTED-BASIS TRICK (why this filter can keep Z = e_1): the augmented
+-- design Z is NOT e_1 (it has ones on every ordinary-diff state, on the last
+-- state of each seasonal cycle block, and on the first ARMA state). But when
+-- kdiff >= 1, row 1 of the augmented T equals Z exactly, R[1] = 0, and the
+-- state intercept never enters row 1 -- so alpha_{t+1}[1] = Z alpha_t
+-- deterministically. Filtering the SHIFTED state beta_t := alpha_{t+1} makes
+-- the observation y_t = beta_t[1] (+ obs intercept), i.e. Z~ = e_1', with the
+-- SAME T, R and RQR. The price is a shifted anchor and intercept timing:
+--    anchor:  a~_1 = T a_1 + c_1 e_cidx,  P~_1 = msym(T P_1 T' + RQR)
+--    step t adds c_{t+1} (not c_t) to row cidx; c_{n+1} is outside the obs
+--    table and is applied as 0 -- the FINAL state returned by
+--    _sarimax_kfilter_state_v2 therefore excludes the c_{n+1} contribution,
+--    which a forecasting layer must add back (it needs c_{n+2}... anyway).
+-- When kdiff = 0 the augmented system IS the v1 system (Z = e_1) and no shift
+-- happens: anchor (a_1, P_1), step t adds c_t -- and because a_1, P_1 are the
+-- stationary fixed points of the shift map, the two cases meet continuously.
+-- statsmodels' predicted-state trace under the shift satisfies
+-- v_t = yd_t - a~_t[1] and F_t = P~_t[1,1] EXACTLY (fixture-validated).
+--
+-- statsmodels-matching arithmetic note: with the approximate-diffuse 1e6
+-- initialization the covariance recursion is ill-conditioned enough that only
+-- same-order-of-operations agreement is achievable; agreement floors measured
+-- against the fixtures are ~1e-14 (stationary), ~3e-10 (kdiff = 1), ~1e-9
+-- (kdiff = 5), ~2e-6 (kdiff = 13) relative on F -- the noise is eps(1e6 * |P|)
+-- amplified through the diffuse collapse, identical in kind to what any
+-- BLAS-vs-fold reordering produces. See tests/test_filter_v2.py tolerances.
+--
+-- Loglikelihood bookkeeping (v2): the recursion carries three accumulators
+-- instead of v1's ll_acc --
+--   cnt      : number of counted steps (v not NULL and t > burn)
+--   sumlogf  : sum of ln F_t over counted steps (NULL-poisoned when F <= 0)
+--   ssq      : sum of v_t^2 / F_t over counted steps
+-- so one filter pass serves both the plain and the CONCENTRATED loglik:
+--   plain: ll = -1/2 (cnt ln 2pi + sumlogf + ssq)          (sigma2 in RQR)
+--   conc:  ll = -1/2 (cnt ln 2pi + sumlogf + cnt ln(ssq/cnt) + cnt),
+--          scale2 = ssq/cnt (the filter ran at sigma2 = 1)
+--
+-- Requires: sql/00_linalg.sql, sql/02_ssm.sql.
+-- ============================================================================
+
+-- ---- v2 initialization builders ------------------------------------------------
+-- (These belong logically to Layer 2 but live here because they depend on
+-- Layer 0 -- _sarimax_lyap / _sarimax_solve_list -- and sql/02_ssm.sql must
+-- keep loading standalone for the v1 Layer-2 acceptance tests.)
+
+-- Initial covariance P1 (k*k flattened): blockdiag(1e6 * I_kdiff,
+-- lyapunov(T_arma, RQR_arma)) with EXACTLY zero cross blocks. tmat_arma and
+-- rqr_arma are the karma-sized v1 blocks (flattened row-major).
+CREATE OR REPLACE MACRO _sarimax_p1_v2(tmat_arma, rqr_arma, karma, d, sd, s) AS (
+    (list_transform([_sarimax_lyap(tmat_arma, rqr_arma, karma)], lambda zlp:
+        list_transform(
+            range(1, (d + s * sd + karma) * (d + s * sd + karma) + 1),
+            lambda zidx:
+            CASE
+              WHEN (zidx - 1) // (d + s * sd + karma) + 1 <= d + s * sd
+                   AND (zidx - 1) % (d + s * sd + karma) + 1 <= d + s * sd
+              THEN CASE WHEN (zidx - 1) // (d + s * sd + karma)
+                             = (zidx - 1) % (d + s * sd + karma)
+                        THEN 1e6 ELSE 0e0 END
+              WHEN (zidx - 1) // (d + s * sd + karma) + 1 > d + s * sd
+                   AND (zidx - 1) % (d + s * sd + karma) + 1 > d + s * sd
+              THEN zlp[((zidx - 1) // (d + s * sd + karma) - (d + s * sd)) * karma
+                       + ((zidx - 1) % (d + s * sd + karma) + 1 - (d + s * sd))]
+              ELSE 0e0 END)))[1]
+);
+
+-- Initial state a1 (k-list): zeros(kdiff) ++ (I - T_arma)^-1 e_1 c_1 on the
+-- ARMA block (all zeros when c1 = 0, i.e. no trend).
+CREATE OR REPLACE MACRO _sarimax_a1_v2(tmat_arma, karma, d, sd, s, c1) AS (
+    CASE WHEN c1 = 0e0 THEN _sarimax_mzeros(d + s * sd + karma, 1)
+    ELSE _sarimax_mzeros(d + s * sd, 1) ||
+         (_sarimax_solve_list(
+             list_transform(range(1, karma * (karma + 1) + 1), lambda zidx:
+                 CASE WHEN (zidx - 1) % (karma + 1) + 1 <= karma
+                      THEN (CASE WHEN (zidx - 1) % (karma + 1) + 1
+                                      = (zidx - 1) // (karma + 1) + 1
+                                 THEN 1e0 ELSE 0e0 END)
+                           - tmat_arma[((zidx - 1) // (karma + 1)) * karma
+                                       + ((zidx - 1) % (karma + 1) + 1)]
+                      ELSE CASE WHEN (zidx - 1) // (karma + 1) = 0
+                                THEN c1 ELSE 0e0 END
+                 END),
+             karma, 1)).x
+    END
+);
+
+-- ---- v2 system construction per probe ----------------------------------------
+
+-- probes_tbl: (probe_id BIGINT, params DOUBLE[]) in v2 canonical order
+-- [tau (ktrend), beta (r), phi, theta, Phi, Theta, (sigma2 unless conc)].
+-- Returns one row per probe:
+--   (probe_id, k, karma, kdiff, cidx, burn, tmat, tmat_t, rqr, p1, a1,
+--    a1f, p1f)
+-- where (p1, a1) are the RAW statsmodels initializations (fixture 'P1'/'a1')
+-- and (p1f, a1f) are the shifted-basis filter anchors described above --
+-- _sarimax_kfilter_v2 consumes a1f/p1f. Probes sharing the arma+sigma2 slice
+-- share one heavy construction (poly expansion + Lyapunov + anchor cov);
+-- only c1 = sum(tau) and hence a1/a1f are per-probe. conc = 1 -> the params
+-- carry no sigma2 slot and the filter runs at sigma2 = 1e0.
+CREATE OR REPLACE MACRO _sarimax_systems_v2(probes_tbl, r, p, q, bigp, bigq, s,
+                                            d, sd, ktrend, conc) AS TABLE
+WITH _sarimax_sv2_args AS (
+    -- bind every scalar arg to a column once (scalar-subquery/lambda trap)
+    SELECT r::BIGINT AS zr, p::BIGINT AS zp, q::BIGINT AS zq,
+           bigp::BIGINT AS zbp, bigq::BIGINT AS zbq, s::BIGINT AS zs,
+           d::BIGINT AS zd, sd::BIGINT AS zsd, ktrend::BIGINT AS zkt,
+           conc::BIGINT AS zconc
+),
+_sarimax_sv2_arma AS (
+    SELECT DISTINCT
+        za.zr, za.zp, za.zq, za.zbp, za.zbq, za.zs, za.zd, za.zsd, za.zkt,
+        list_slice(pr.params, za.zkt + za.zr + 1,
+                   za.zkt + za.zr + za.zp + za.zq + za.zbp + za.zbq
+                   + CASE WHEN za.zconc = 1 THEN 0 ELSE 1 END) AS armav,
+        za.zconc
+    FROM query_table(probes_tbl) pr
+    CROSS JOIN _sarimax_sv2_args za
+),
+_sarimax_sv2_poly AS (
+    SELECT zr, zkt, zd, zsd, zs, armav,
+           _sarimax_k_states(zp, zq, zbp, zbq, zs) AS karma,
+           _sarimax_kdiff(zd, zsd, zs) AS kdiff,
+           _sarimax_expand_ar(
+               list_slice(armav, 1, zp),
+               list_slice(armav, zp + zq + 1, zp + zq + zbp), zs) AS phistar,
+           _sarimax_expand_ma(
+               list_slice(armav, zp + 1, zp + zq),
+               list_slice(armav, zp + zq + zbp + 1, zp + zq + zbp + zbq),
+               zs) AS thetastar,
+           CASE WHEN zconc = 1 THEN 1e0
+                ELSE armav[zp + zq + zbp + zbq + 1] END AS sigma2
+    FROM _sarimax_sv2_arma
+),
+_sarimax_sv2_tr AS (
+    SELECT zr, zkt, zd, zsd, zs, armav, karma, kdiff, kdiff + karma AS k,
+           sigma2,
+           _sarimax_build_t(phistar, karma) AS tmat_arma,
+           _sarimax_build_r(thetastar, karma) AS rvec_arma,
+           _sarimax_build_t_v2(phistar, karma, zd, zsd, zs) AS tmat,
+           _sarimax_build_r_v2(thetastar, karma, zd, zsd, zs) AS rvec
+    FROM _sarimax_sv2_poly
+),
+_sarimax_sv2_rqr AS (
+    SELECT zr, zkt, zd, zsd, zs, armav, karma, kdiff, k, tmat, tmat_arma,
+           _sarimax_mtrans(tmat, k, k) AS tmat_t,
+           _sarimax_build_rqr(rvec, sigma2, k) AS rqr,
+           _sarimax_build_rqr(rvec_arma, sigma2, karma) AS rqr_arma
+    FROM _sarimax_sv2_tr
+),
+_sarimax_sv2_p1 AS (
+    SELECT *, _sarimax_p1_v2(tmat_arma, rqr_arma, karma, zd, zsd, zs) AS p1
+    FROM _sarimax_sv2_rqr
+),
+-- shifted-anchor covariance, staged one matrix op per derived table (k^5 trap)
+_sarimax_sv2_pf1 AS (
+    SELECT *, _sarimax_mmul(tmat, p1, k, k, k) AS tp1 FROM _sarimax_sv2_p1
+),
+_sarimax_sv2_pf2 AS (
+    SELECT *, _sarimax_mmul(tp1, tmat_t, k, k, k) AS tp1t FROM _sarimax_sv2_pf1
+),
+_sarimax_sv2_pf3 AS (
+    SELECT *, _sarimax_madd(tp1t, rqr) AS tp1tr FROM _sarimax_sv2_pf2
+),
+_sarimax_sv2_sys AS (
+    SELECT zr, zkt, armav, karma, kdiff, k, tmat, tmat_arma, tmat_t, rqr, p1,
+           zd, zsd, zs,
+           CASE WHEN kdiff = 0 THEN p1
+                ELSE _sarimax_msym(tp1tr, k) END AS p1f
+    FROM _sarimax_sv2_pf3
+),
+_sarimax_sv2_probe AS (
+    SELECT pr.probe_id, b.*,
+           CASE WHEN b.zkt = 0 THEN 0e0
+                ELSE list_reduce(
+                    list_prepend(0e0, list_slice(pr.params, 1, b.zkt)),
+                    lambda zacc, zx: zacc + zx) END AS c1
+    FROM query_table(probes_tbl) pr
+    JOIN _sarimax_sv2_sys b
+      ON b.armav = list_slice(pr.params, b.zkt + b.zr + 1,
+                              b.zkt + b.zr + len(b.armav))
+),
+_sarimax_sv2_a1 AS (
+    SELECT *, _sarimax_a1_v2(tmat_arma, karma, zd, zsd, zs, c1) AS a1
+    FROM _sarimax_sv2_probe
+),
+_sarimax_sv2_ta1 AS (
+    SELECT *, _sarimax_mmul(tmat, a1, k, k, 1) AS ta1 FROM _sarimax_sv2_a1
+)
+SELECT probe_id, k, karma, kdiff, (kdiff + 1)::BIGINT AS cidx,
+       kdiff::BIGINT AS burn, tmat, tmat_t, rqr, p1, a1,
+       CASE WHEN kdiff = 0 THEN a1
+            ELSE list_transform(range(1, k + 1), lambda zi:
+                     ta1[zi] + CASE WHEN zi = kdiff + 1 THEN c1
+                                    ELSE 0e0 END) END AS a1f,
+       p1f
+FROM _sarimax_sv2_ta1;
+
+-- ---- v2 observation prep -------------------------------------------------------
+
+-- y_tbl: (t BIGINT, y DOUBLE) UNdifferenced series, t = 1..n; y may be NULL
+-- (missing). exog_tbl: (t, j, x) long-form UNdifferenced IN-SAMPLE exog (zero
+-- rows when r = 0). degs_tbl: (idx BIGINT, degree BIGINT) trend polynomial
+-- degrees (fixture trend.parquet; empty when no trend).
+-- Returns (probe_id, t, yd, ct): yd = y_t - x_t' beta (NULL when y_t NULL),
+-- ct = c_t = sum_g tau_g * t**deg_g (0e0 when ktrend = 0). Ordered folds.
+CREATE OR REPLACE MACRO _sarimax_obs_adj_v2(y_tbl, exog_tbl, probes_tbl,
+                                            r, ktrend, degs_tbl) AS TABLE
+WITH _sarimax_oa2_args AS (
+    SELECT r::BIGINT AS zr, ktrend::BIGINT AS zkt
+),
+_sarimax_oa2_degs AS (
+    SELECT coalesce(list(degree::BIGINT ORDER BY idx), []::BIGINT[]) AS degs
+    FROM query_table(degs_tbl)
+),
+_sarimax_oa2_pr AS (
+    SELECT pr.probe_id,
+           list_slice(pr.params, za.zkt + 1, za.zkt + za.zr) AS beta,
+           list_slice(pr.params, 1, za.zkt) AS tau,
+           dg.degs
+    FROM query_table(probes_tbl) pr, _sarimax_oa2_args za, _sarimax_oa2_degs dg
+),
+_sarimax_oa2_int AS (
+    SELECT pr.probe_id, e.t,
+           list_reduce(
+               list_prepend(0e0, list(e.x * pr.beta[e.j] ORDER BY e.j)),
+               lambda zacc, zxb: zacc + zxb) AS d
+    FROM _sarimax_oa2_pr pr
+    CROSS JOIN query_table(exog_tbl) e
+    GROUP BY pr.probe_id, e.t
+)
+SELECT pr.probe_id, w.t,
+       w.y - coalesce(di.d, 0e0) AS yd,
+       CASE WHEN len(pr.tau) = 0 THEN 0e0
+            ELSE (_sarimax_trend_c(pr.degs, pr.tau, w.t, 1))[1] END AS ct
+FROM _sarimax_oa2_pr pr
+CROSS JOIN query_table(y_tbl) w
+LEFT JOIN _sarimax_oa2_int di
+       ON di.probe_id = pr.probe_id AND di.t = w.t;
+
+-- ---- the v2 filter --------------------------------------------------------------
+
+-- obs_tbl: (probe_id, t, yd, ct), t dense 1..n per probe (yd NULL = missing).
+-- sys_tbl: output of _sarimax_systems_v2.
+-- Full trace (probe_id, t, v, f, cnt, sumlogf, ssq); accumulators are the
+-- running values through step t (strict t-order folds). Per-step semantics:
+--   v = yd_t - a[1] (NULL when yd NULL); f = p[1] (always reported)
+--   a' = T a + (v NULL ? 0 : (TP e_1) v / f) + c e_cidx
+--   P' = msym((v NULL ? T P T' : T P T' - (TP e_1)(TP e_1)'/f) + RQR)
+--   counted (v not NULL and t > burn): cnt += 1, sumlogf += ln f (NULL when
+--   f <= 0, poisoning the accumulator), ssq += v^2/f.
+-- The intercept c applied at step t is ct at row t + 1 when kdiff > 0 (the
+-- shifted-basis timing; 0 beyond the sample) and ct at row t when kdiff = 0.
+CREATE OR REPLACE MACRO _sarimax_kfilter_v2(obs_tbl, sys_tbl) AS TABLE
+WITH RECURSIVE _sarimax_kf2 USING KEY (probe_id, t) AS (
+    SELECT s.probe_id,
+           0::BIGINT AS t,
+           s.a1f AS a,
+           s.p1f AS p,
+           NULL::DOUBLE AS v,
+           NULL::DOUBLE AS f,
+           0::BIGINT AS cnt,
+           0e0 AS sumlogf,
+           0e0 AS ssq
+    FROM query_table(sys_tbl) s
+    UNION ALL
+    SELECT probe_id, t,
+           list_transform(range(1, k + 1), lambda zi:
+               ta[zi]
+               + (CASE WHEN v IS NULL THEN 0e0 ELSE tpz[zi] * v / f END)
+               + (CASE WHEN zi = cidx THEN ct ELSE 0e0 END)) AS a,
+           _sarimax_msym(prqr, k) AS p,
+           v, f,
+           cnt + CASE WHEN v IS NOT NULL AND t > burn
+                      THEN 1::BIGINT ELSE 0::BIGINT END AS cnt,
+           sumlogf + CASE WHEN v IS NOT NULL AND t > burn
+                          THEN CASE WHEN f > 0e0 THEN ln(f) ELSE NULL END
+                          ELSE 0e0 END AS sumlogf,
+           ssq + CASE WHEN v IS NOT NULL AND t > burn
+                      THEN v * v / f ELSE 0e0 END AS ssq
+    FROM (
+        SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, ct, v, f, ta, tpz,
+               _sarimax_madd(psel, rqr) AS prqr
+        FROM (
+            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct, v, f,
+                   ta, tpz,
+                   CASE WHEN v IS NULL THEN tpt
+                        ELSE _sarimax_msub(tpt, outerm) END AS psel
+            FROM (
+                SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
+                       v, f, ta, tpz,
+                       _sarimax_mmul(tp, tmat_t, k, k, k) AS tpt,
+                       list_transform(range(1, k * k + 1), lambda zidx:
+                           tpz[(zidx - 1) // k + 1]
+                           * tpz[(zidx - 1) % k + 1] / f) AS outerm
+                FROM (
+                    SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
+                           tmat_t, rqr, ct, v, f, tp,
+                           list_transform(range(1, k + 1), lambda zi:
+                               tp[(zi - 1) * k + 1]) AS tpz,
+                           ta
+                    FROM (
+                        SELECT kf.probe_id, kf.t + 1 AS t, kf.cnt, kf.sumlogf,
+                               kf.ssq, s.k AS k, s.cidx, s.burn, s.tmat_t,
+                               s.rqr,
+                               coalesce(oc.ct, 0e0) AS ct,
+                               o.yd - kf.a[1] AS v,
+                               kf.p[1] AS f,
+                               _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k) AS tp,
+                               _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1) AS ta
+                        FROM _sarimax_kf2 kf
+                        JOIN query_table(sys_tbl) s
+                          ON s.probe_id = kf.probe_id
+                        JOIN query_table(obs_tbl) o
+                          ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
+                        LEFT JOIN query_table(obs_tbl) oc
+                          ON oc.probe_id = kf.probe_id
+                         AND oc.t = kf.t + 1
+                                   + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
+                    )
+                )
+            )
+        )
+    )
+)
+SELECT probe_id, t, v, f, cnt, sumlogf, ssq
+FROM _sarimax_kf2
+WHERE t >= 1;
+
+-- Compact variant (USING KEY probe_id: each iteration replaces the row, only
+-- the final state survives). Same arithmetic as _sarimax_kfilter_v2. Returns
+-- (probe_id, n_eff, a, p, cnt, sumlogf, ssq); note the shifted-basis caveat
+-- above about the missing c_{n+1} term in the final a when kdiff > 0.
+CREATE OR REPLACE MACRO _sarimax_kfilter_state_v2(obs_tbl, sys_tbl) AS TABLE
+WITH RECURSIVE _sarimax_kfs2 USING KEY (probe_id) AS (
+    SELECT s.probe_id,
+           0::BIGINT AS t,
+           s.a1f AS a,
+           s.p1f AS p,
+           0::BIGINT AS cnt,
+           0e0 AS sumlogf,
+           0e0 AS ssq
+    FROM query_table(sys_tbl) s
+    UNION ALL
+    SELECT probe_id, t,
+           list_transform(range(1, k + 1), lambda zi:
+               ta[zi]
+               + (CASE WHEN v IS NULL THEN 0e0 ELSE tpz[zi] * v / f END)
+               + (CASE WHEN zi = cidx THEN ct ELSE 0e0 END)) AS a,
+           _sarimax_msym(prqr, k) AS p,
+           cnt + CASE WHEN v IS NOT NULL AND t > burn
+                      THEN 1::BIGINT ELSE 0::BIGINT END AS cnt,
+           sumlogf + CASE WHEN v IS NOT NULL AND t > burn
+                          THEN CASE WHEN f > 0e0 THEN ln(f) ELSE NULL END
+                          ELSE 0e0 END AS sumlogf,
+           ssq + CASE WHEN v IS NOT NULL AND t > burn
+                      THEN v * v / f ELSE 0e0 END AS ssq
+    FROM (
+        SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, ct, v, f, ta, tpz,
+               _sarimax_madd(psel, rqr) AS prqr
+        FROM (
+            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct, v, f,
+                   ta, tpz,
+                   CASE WHEN v IS NULL THEN tpt
+                        ELSE _sarimax_msub(tpt, outerm) END AS psel
+            FROM (
+                SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
+                       v, f, ta, tpz,
+                       _sarimax_mmul(tp, tmat_t, k, k, k) AS tpt,
+                       list_transform(range(1, k * k + 1), lambda zidx:
+                           tpz[(zidx - 1) // k + 1]
+                           * tpz[(zidx - 1) % k + 1] / f) AS outerm
+                FROM (
+                    SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
+                           tmat_t, rqr, ct, v, f, tp,
+                           list_transform(range(1, k + 1), lambda zi:
+                               tp[(zi - 1) * k + 1]) AS tpz,
+                           ta
+                    FROM (
+                        SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.cnt,
+                               kfs.sumlogf, kfs.ssq, s.k AS k, s.cidx, s.burn,
+                               s.tmat_t, s.rqr,
+                               coalesce(oc.ct, 0e0) AS ct,
+                               o.yd - kfs.a[1] AS v,
+                               kfs.p[1] AS f,
+                               _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k) AS tp,
+                               _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1) AS ta
+                        FROM _sarimax_kfs2 kfs
+                        JOIN query_table(sys_tbl) s
+                          ON s.probe_id = kfs.probe_id
+                        JOIN query_table(obs_tbl) o
+                          ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
+                        LEFT JOIN query_table(obs_tbl) oc
+                          ON oc.probe_id = kfs.probe_id
+                         AND oc.t = kfs.t + 1
+                                   + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
+                    )
+                )
+            )
+        )
+    )
+)
+SELECT probe_id, t AS n_eff, a, p, cnt, sumlogf, ssq
+FROM _sarimax_kfs2;
+
+-- Loglikelihood per probe. conc: 0 = sigma2 lives in RQR (standard formula),
+-- 1 = concentrated scale (filter ran at sigma2 = 1; scale2 = ssq/cnt).
+-- A NULL-poisoned sumlogf (some counted F_t <= 0) propagates to loglik NULL.
+CREATE OR REPLACE MACRO _sarimax_loglik_v2(obs_tbl, sys_tbl, conc) AS TABLE
+WITH _sarimax_ll2_args AS (
+    SELECT conc::BIGINT AS zconc
+)
+SELECT st.probe_id, st.n_eff,
+       CASE WHEN za.zconc = 1
+            THEN -5e-1 * (st.cnt * ln(2e0 * pi()) + st.sumlogf
+                          + st.cnt * ln(st.ssq / st.cnt) + st.cnt)
+            ELSE -5e-1 * (st.cnt * ln(2e0 * pi()) + st.sumlogf + st.ssq)
+       END AS loglik,
+       CASE WHEN za.zconc = 1 THEN st.ssq / st.cnt
+            ELSE NULL::DOUBLE END AS scale2
+FROM _sarimax_kfilter_state_v2(obs_tbl, sys_tbl) st, _sarimax_ll2_args za;
 
 
 -- ================== sql/04_estimate.sql ==================
@@ -2776,6 +3328,1301 @@ FROM (
 ) zng;
 
 
+-- ============================================================================
+-- SECTION 3: v2 estimation engine (appended; simple_differencing = FALSE,
+-- missing values, trend terms, concentrated scale). Section 1/2 macros are
+-- FROZEN -- the v1 acceptance suite keeps running against them unchanged.
+--
+--   3a. conc-aware parameter transform   _sarimax_transform_params_v2 /
+--                                        _sarimax_untransform_params_v2
+--   3b. scalar loglikelihood kernel      _sarimax_ll_c_v2 / _sarimax_ll_x_v2
+--   3c. starting values                  _sarimax_start_params_v2
+--   3d. BFGS optimizer                   _sarimax_bfgs_v2
+--   3e. standard errors                  _sarimax_bse_v2
+--
+-- v2 canonical parameter order: tau_1..tau_ktrend, beta_1..beta_r, phi,
+-- theta, Phi, Theta, sigma2 -- the sigma2 slot EXISTS ONLY when NOT
+-- concentrated. The transform is the v1 PACF bijection on the four ARMA
+-- blocks, identity on the leading ktrend + r entries, and square/sqrt on the
+-- sigma2 slot when present (verified against fixtures_v2 probes.parquet).
+--
+-- THE KERNEL'S STATE REPRESENTATION (one-step-shifted; derivation): the
+-- augmented system of sql/02_ssm.sql section 2 has design Z equal to ROW 1 of
+-- the transition T, and its selection R has R[1] = 0 whenever kdiff > 0.
+-- Writing the statsmodels recursion alpha_{t+1} = T alpha_t + c_t e_cidx
+-- + R eta_t, y_t = Z alpha_t, and defining gamma_t := alpha_{t+1}, gives the
+-- IDENTITY y_t = (T alpha_t)[1] = gamma_t[1] - (c_t e_cidx + R eta_t)[1]
+-- = gamma_t[1] (both intercept and noise rows vanish at index 1 for
+-- kdiff > 0). gamma therefore follows a state-space model with the SAME T and
+-- R, design e_1', intercept c_{t+1} e_cidx consumed at step t, and exact
+-- initial moments E[gamma_1] = T a1 + c_1 e_cidx,
+-- Var[gamma_1] = T P1 T' + RQR'. The kernel below filters gamma: v_t =
+-- yd_t - a[1], F_t = P[1,1], gain = col1(T P)/F -- ALGEBRAICALLY IDENTICAL
+-- innovations to statsmodels' general-Z filter (fixture-validated), with the
+-- v1 kernel's exact fold shape. When kdiff = 0 the design is natively e_1'
+-- and the kernel runs UNSHIFTED (plain v1 recursion + intercept c_t at state
+-- 1, stationary a1/P1) -- the only branch points are the initial (a, P) pair
+-- and the one-step intercept alignment (c_{t+1} vs c_t), both bound once.
+--
+-- P1 inside the kernel: same 30-iteration DOUBLING Lyapunov solve as the v1
+-- kernel (documented deviation, section 2 header) for the ARMA block;
+-- blockdiag(1e6 I_kdiff, .) matches _sarimax_p1_v2 exactly (fixture ssm
+-- P1 rows are blockdiag with EXACT zero cross terms).
+--
+-- MEASURED NOISE FLOOR (documented, affects the T1 gate of ONE fixture): with
+-- the approximate-diffuse 1e6 initialization, every filter update after the
+-- diffuse states collapse carries catastrophic-cancellation noise of order
+-- kappa * eps / F_t RELATIVE per step. On nodiff_sarimax_011_011_12
+-- (log-airline scale, F_t ~ 2e-3 post-burn, 131 post-burn steps) a
+-- 40-digit-Decimal reference filter puts statsmodels' own loglike 4.0e-5 from
+-- exact arithmetic at probe 1 (this kernel: 9.5e-6 from exact -- CLOSER than
+-- the reference implementation) and 1.5e-7 at theta-hat. No independent
+-- float64 implementation can match statsmodels' reported loglike beyond that
+-- floor on this fixture; tests/test_estimate_v2.py gates it at rel <= 5e-7
+-- (all other fixtures: the pinned abs <= 1e-8 / rel <= 1e-10).
+--
+-- Lambda discipline: identical to section 2 (z-prefixed lambda vars; ylist /
+-- xmat / degs / cpar must be materialized values or plain columns -- textual
+-- macro expansion re-evaluates argument expressions at every reference).
+-- ============================================================================
+
+-- ---- 3a. conc-aware parameter transform ----------------------------------------
+
+-- Unconstrained -> constrained. rtot = ktrend + r identity entries; NO sigma2
+-- slot when conc (the v1 macro unconditionally appends u[last]^2).
+CREATE OR REPLACE MACRO _sarimax_transform_params_v2(u, rtot, p, q, bigp, bigq, conc) AS (
+    list_slice(u, 1, rtot)
+    || _sarimax_constrain_block(list_slice(u, rtot + 1, rtot + p), -1.0::DOUBLE)
+    || _sarimax_constrain_block(list_slice(u, rtot + p + 1, rtot + p + q), 1.0::DOUBLE)
+    || _sarimax_constrain_block(list_slice(u, rtot + p + q + 1, rtot + p + q + bigp), -1.0::DOUBLE)
+    || _sarimax_constrain_block(list_slice(u, rtot + p + q + bigp + 1, rtot + p + q + bigp + bigq), 1.0::DOUBLE)
+    || CASE WHEN conc THEN []::DOUBLE[]
+            ELSE [u[rtot + p + q + bigp + bigq + 1] * u[rtot + p + q + bigp + bigq + 1]] END
+);
+
+-- Constrained -> unconstrained (sqrt on sigma2 only when the slot exists).
+CREATE OR REPLACE MACRO _sarimax_untransform_params_v2(c, rtot, p, q, bigp, bigq, conc) AS (
+    list_slice(c, 1, rtot)
+    || _sarimax_unconstrain_block(list_slice(c, rtot + 1, rtot + p), -1.0::DOUBLE)
+    || _sarimax_unconstrain_block(list_slice(c, rtot + p + 1, rtot + p + q), 1.0::DOUBLE)
+    || _sarimax_unconstrain_block(list_slice(c, rtot + p + q + 1, rtot + p + q + bigp), -1.0::DOUBLE)
+    || _sarimax_unconstrain_block(list_slice(c, rtot + p + q + bigp + 1, rtot + p + q + bigp + bigq), 1.0::DOUBLE)
+    || CASE WHEN conc THEN []::DOUBLE[]
+            ELSE [sqrt(c[rtot + p + q + bigp + bigq + 1])] END
+);
+
+-- ---- 3b. scalar loglikelihood kernel -------------------------------------------
+
+-- Loglikelihood + scale at a CONSTRAINED v2 parameter vector. ylist is the
+-- MODEL-scale series (raw y when kdiff > 0; pre-differenced when the caller
+-- runs simple_differencing with d = sd = 0) with SQL NULL at missing t; xmat
+-- the UNdifferenced exog rows (n lists of length r; [] or n empty lists when
+-- r = 0); degs the BIGINT[] 0-based trend degrees (length ktrend). Returns
+-- STRUCT(ll DOUBLE, scale2 DOUBLE); ll is NULL when poisoned (F_t <= 0 on an
+-- accumulated step, or non-finite ll from an explosive probe); scale2 is
+-- ssq/cnt when conc (the concentrated scale) and the sigma2 parameter
+-- otherwise. Loglikelihood sums NON-MISSING t > burn, burn = kdiff.
+CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
+                                         r, p, q, bigp, bigq, s, d, sd, ktrend, conc) AS (
+  (list_transform([struct_pack(
+      zka := _sarimax_k_states(p, q, bigp, bigq, s),
+      zkd := _sarimax_kdiff(d, sd, s),
+      zn := len(ylist),
+      ztau := list_slice(cpar, 1, ktrend),
+      zbeta := list_slice(cpar, ktrend + 1, ktrend + r),
+      zphistar := _sarimax_expand_ar(
+          list_slice(cpar, ktrend + r + 1, ktrend + r + p),
+          list_slice(cpar, ktrend + r + p + q + 1, ktrend + r + p + q + bigp), s),
+      zthetastar := _sarimax_expand_ma(
+          list_slice(cpar, ktrend + r + p + 1, ktrend + r + p + q),
+          list_slice(cpar, ktrend + r + p + q + bigp + 1,
+                     ktrend + r + p + q + bigp + bigq), s),
+      zsigma2 := CASE WHEN conc THEN 1e0
+                      ELSE cpar[ktrend + r + p + q + bigp + bigq + 1] END)],
+   lambda zl1:
+     (list_transform([struct_pack(
+         zk := zl1.zkd + zl1.zka,
+         ztm := _sarimax_build_t_v2(zl1.zphistar, zl1.zka, d, sd, s),
+         zta := _sarimax_build_t(zl1.zphistar, zl1.zka),
+         zrv := _sarimax_build_r_v2(zl1.zthetastar, zl1.zka, d, sd, s),
+         zrva := _sarimax_build_r(zl1.zthetastar, zl1.zka),
+         -- yd_t = y_t - x_t' beta (UNdifferenced exog; ordered-j fold seeded
+         -- 0e0; NULL y propagates, r = 0 never indexes xmat)
+         zyd := list_transform(range(1, zl1.zn + 1), lambda zt:
+                    ylist[zt] - list_reduce(
+                        list_prepend(0e0, list_transform(range(1, r + 1), lambda zj:
+                            xmat[zt][zj] * (zl1.zbeta)[zj])),
+                        lambda za, zb: za + zb)),
+         -- c_t for t = 1..n+1 (n+1 so the kdiff>0 shifted alignment below can
+         -- consume c_{t+1} at step t; empty degs folds to zeros)
+         zcl := _sarimax_trend_c(degs, zl1.ztau, 1, zl1.zn + 1))],
+      lambda zl2:
+        (list_transform([struct_pack(
+            ztt := _sarimax_mtrans(zl2.ztm, zl2.zk, zl2.zk),
+            zrqr := _sarimax_build_rqr(zl2.zrv, zl1.zsigma2, zl2.zk),
+            zrqra := _sarimax_build_rqr(zl2.zrva, zl1.zsigma2, zl1.zka),
+            za1u := _sarimax_a1_v2(zl2.zta, zl1.zka, d, sd, s, (zl2.zcl)[1]))],
+         lambda zl3:
+           -- ARMA-block P1 by 30 doubling iterations (bound before msym)
+           (list_transform([(list_reduce(
+                    [struct_pack(zsm := zl3.zrqra, zaa := zl2.zta)]
+                      || list_transform(range(1, 31), lambda zd2:
+                           struct_pack(zsm := []::DOUBLE[], zaa := []::DOUBLE[])),
+                    lambda zacc, zel:
+                      (list_transform([_sarimax_mmul(zacc.zaa, zacc.zsm,
+                                                     zl1.zka, zl1.zka, zl1.zka)],
+                       lambda zas:
+                         (list_transform([_sarimax_mtrans(zacc.zaa, zl1.zka, zl1.zka)],
+                          lambda zat2:
+                            (list_transform([_sarimax_mmul(zas, zat2,
+                                                           zl1.zka, zl1.zka, zl1.zka)],
+                             lambda zasat:
+                               struct_pack(
+                                 zsm := _sarimax_madd(zacc.zsm, zasat),
+                                 zaa := _sarimax_mmul(zacc.zaa, zacc.zaa,
+                                                      zl1.zka, zl1.zka, zl1.zka))))[1]
+                         ))[1]
+                      ))[1]
+                 )).zsm],
+            lambda zs30:
+           (list_transform([_sarimax_msym(zs30, zl1.zka)],
+            lambda zsig:
+              -- blockdiag(1e6 I_kdiff, Sigma), the UNSHIFTED P1
+              (list_transform([list_transform(range(1, zl2.zk * zl2.zk + 1), lambda zidx:
+                   CASE
+                     WHEN (zidx - 1) // zl2.zk + 1 <= zl1.zkd
+                          AND (zidx - 1) % zl2.zk + 1 <= zl1.zkd
+                     THEN CASE WHEN (zidx - 1) // zl2.zk = (zidx - 1) % zl2.zk
+                               THEN 1e6 ELSE 0e0 END
+                     WHEN (zidx - 1) // zl2.zk + 1 > zl1.zkd
+                          AND (zidx - 1) % zl2.zk + 1 > zl1.zkd
+                     THEN zsig[((zidx - 1) // zl2.zk - zl1.zkd) * zl1.zka
+                               + ((zidx - 1) % zl2.zk + 1 - zl1.zkd)]
+                     ELSE 0e0 END)],
+               lambda zp1b:
+                 -- shift conjugation: Var[gamma_1] = T P1 T' + RQR,
+                 -- E[gamma_1] = T a1 + c_1 e_cidx (kdiff > 0 only)
+                 (list_transform([struct_pack(
+                      ztp1 := _sarimax_mmul(zl2.ztm, zp1b, zl2.zk, zl2.zk, zl2.zk),
+                      zta1 := _sarimax_mmul(zl2.ztm, zl3.za1u, zl2.zk, zl2.zk, 1))],
+                  lambda zl7:
+                    (list_transform([_sarimax_mmul(zl7.ztp1, zl3.ztt,
+                                                   zl2.zk, zl2.zk, zl2.zk)],
+                     lambda ztp1t:
+                       -- msym mirrors _sarimax_systems_v2's p1f exactly (the
+                       -- madd result is bound before msym sees it)
+                       (list_transform([struct_pack(
+                            zp1sh := (list_transform([_sarimax_madd(ztp1t, zl3.zrqr)],
+                                          lambda zpm: _sarimax_msym(zpm, zl2.zk)))[1],
+                            za1sh := list_transform(range(1, zl2.zk + 1), lambda zi5:
+                                         (zl7.zta1)[zi5]
+                                         + CASE WHEN zi5 = zl1.zkd + 1
+                                                THEN (zl2.zcl)[1] ELSE 0e0 END))],
+                        lambda zl9:
+                          (list_transform([struct_pack(
+                               zp1 := CASE WHEN zl1.zkd = 0 THEN zp1b
+                                           ELSE zl9.zp1sh END,
+                               za1 := CASE WHEN zl1.zkd = 0 THEN zl3.za1u
+                                           ELSE zl9.za1sh END,
+                               -- per-step intercept: c_t unshifted, c_{t+1} shifted
+                               zcs := CASE WHEN zl1.zkd = 0
+                                           THEN list_slice(zl2.zcl, 1, zl1.zn)
+                                           ELSE list_slice(zl2.zcl, 2, zl1.zn + 1) END)],
+                           lambda zl10:
+                             -- Kalman fold in strict t order; accumulator and
+                             -- elements share one struct type; per-step yd,
+                             -- intercept and t ride in zydv/zct/zti
+                             (list_transform([(list_reduce(
+                                [struct_pack(za2 := zl10.za1, zp2 := zl10.zp1,
+                                             zcnt := 0e0, zslf := 0e0, zssq := 0e0,
+                                             zydv := 0e0, zct := 0e0, zti := 0::BIGINT)]
+                                  || list_transform(range(1, zl1.zn + 1), lambda zt:
+                                       struct_pack(za2 := []::DOUBLE[], zp2 := []::DOUBLE[],
+                                                   zcnt := 0e0, zslf := 0e0, zssq := 0e0,
+                                                   zydv := (zl2.zyd)[zt],
+                                                   zct := (zl10.zcs)[zt], zti := zt)),
+                                lambda zacc, zel:
+                                  (list_transform([struct_pack(
+                                       zv := zel.zydv - (zacc.za2)[1],
+                                       zf := (zacc.zp2)[1],
+                                       ztp := _sarimax_mmul(zl2.ztm, zacc.zp2,
+                                                            zl2.zk, zl2.zk, zl2.zk),
+                                       zta2 := _sarimax_mmul(zl2.ztm, zacc.za2,
+                                                             zl2.zk, zl2.zk, 1))],
+                                   lambda zi1:
+                                     (list_transform([list_transform(range(1, zl2.zk + 1),
+                                                          lambda zi2:
+                                                              (zi1.ztp)[(zi2 - 1) * zl2.zk + 1])],
+                                      lambda ztpz:
+                                        (list_transform([struct_pack(
+                                             ztpt := _sarimax_mmul(zi1.ztp, zl3.ztt,
+                                                                   zl2.zk, zl2.zk, zl2.zk),
+                                             zoutr := list_transform(
+                                                 range(1, zl2.zk * zl2.zk + 1), lambda zi4:
+                                                     ztpz[(zi4 - 1) // zl2.zk + 1]
+                                                     * ztpz[(zi4 - 1) % zl2.zk + 1] / zi1.zf))],
+                                         lambda zb1:
+                                           (list_transform([_sarimax_msub(zb1.ztpt, zb1.zoutr)],
+                                            lambda zmsb:
+                                              (list_transform([CASE WHEN zi1.zv IS NULL
+                                                                    THEN zb1.ztpt
+                                                                    ELSE zmsb END],
+                                               lambda zpre:
+                                                 (list_transform([_sarimax_madd(zpre, zl3.zrqr)],
+                                                  lambda zpu:
+                                                    struct_pack(
+                                                      za2 := list_transform(
+                                                          range(1, zl2.zk + 1), lambda zi3:
+                                                              (zi1.zta2)[zi3]
+                                                              + (CASE WHEN zi1.zv IS NULL THEN 0e0
+                                                                      ELSE ztpz[zi3] * zi1.zv / zi1.zf END)
+                                                              + (CASE WHEN zi3 = zl1.zkd + 1
+                                                                      THEN zel.zct ELSE 0e0 END)),
+                                                      zp2 := _sarimax_msym(zpu, zl2.zk),
+                                                      zcnt := zacc.zcnt
+                                                          + CASE WHEN zi1.zv IS NOT NULL
+                                                                      AND zel.zti > zl1.zkd
+                                                                 THEN 1e0 ELSE 0e0 END,
+                                                      zslf := zacc.zslf
+                                                          + CASE WHEN zi1.zv IS NULL
+                                                                      OR zel.zti <= zl1.zkd
+                                                                 THEN 0e0
+                                                                 WHEN zi1.zf > 0e0 THEN ln(zi1.zf)
+                                                                 ELSE NULL END,
+                                                      zssq := zacc.zssq
+                                                          + CASE WHEN zi1.zv IS NULL
+                                                                      OR zel.zti <= zl1.zkd
+                                                                 THEN 0e0
+                                                                 ELSE zi1.zv * zi1.zv / zi1.zf END,
+                                                      zydv := 0e0, zct := 0e0,
+                                                      zti := 0::BIGINT)))[1]
+                                              ))[1]
+                                           ))[1]
+                                        ))[1]
+                                     ))[1]
+                                  ))[1]
+                             ))],
+                              lambda zfr:
+                                (list_transform([CASE WHEN conc
+                                     THEN CASE WHEN zfr.zcnt > 0e0 AND zfr.zssq > 0e0
+                                               THEN -5e-1 * (zfr.zcnt * ln(2e0 * pi())
+                                                             + zfr.zslf
+                                                             + zfr.zcnt * ln(zfr.zssq / zfr.zcnt)
+                                                             + zfr.zcnt)
+                                               ELSE NULL END
+                                     ELSE -5e-1 * (zfr.zcnt * ln(2e0 * pi())
+                                                   + zfr.zslf + zfr.zssq) END],
+                                 lambda zllr:
+                                   struct_pack(
+                                     ll := CASE WHEN zllr IS NOT NULL AND isfinite(zllr)
+                                                THEN zllr ELSE NULL END,
+                                     scale2 := CASE WHEN conc
+                                                    THEN CASE WHEN zfr.zcnt > 0e0
+                                                                   AND isfinite(zfr.zssq)
+                                                              THEN zfr.zssq / zfr.zcnt
+                                                              ELSE NULL END
+                                                    ELSE cpar[ktrend + r + p + q
+                                                              + bigp + bigq + 1] END)))[1]
+                          ))[1]
+                       ))[1]
+                    ))[1]
+                 ))[1]
+              ))[1]
+           ))[1]
+           ))[1]
+           ))[1]
+        ))[1]
+     ))[1]
+  ))[1]
+);
+
+-- Loglikelihood struct at an UNCONSTRAINED v2 vector (the optimizer's
+-- objective evaluates -(...).ll).
+CREATE OR REPLACE MACRO _sarimax_ll_x_v2(xunc, ylist, xmat, degs,
+                                         r, p, q, bigp, bigq, s, d, sd, ktrend, conc) AS (
+  _sarimax_ll_c_v2(
+      _sarimax_transform_params_v2(xunc, ktrend + r, p, q, bigp, bigq, conc),
+      ylist, xmat, degs, r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+);
+
+-- ---- 3c. starting values (v2: differencing, missing values, trend, conc) -------
+
+-- One row (x0 DOUBLE[] unconstrained, params0 DOUBLE[] constrained), v2
+-- canonical order. Inputs: y_tbl (t, y) MODEL-scale series with NULLs at
+-- missing t; exog_tbl (t, j, x) UNdifferenced long-form exog (rows with
+-- t <= n are used; zero rows when r = 0); degs_tbl (idx, degree) the 0-based
+-- trend polynomial degrees.
+--
+-- Strategy (start values must be finite and interior, not statsmodels-equal):
+--   1. Difference y and the joint [trend-on-original-timeline | exog]
+--      regressor block d ordinary + sd seasonal times via ONE convolution
+--      with the lag polynomial (1-L)^d (1-L^s)^sd (NULL y propagates through
+--      any window that touches a missing value).
+--   2. OLS of w on the differenced regressors over COMPLETE CASES only.
+--      Differencing annihilates trend columns of degree < d + sd-ish (e.g.
+--      'c' under d = 1): columns with fold(x^2) <= 1e-12 are DROPPED and get
+--      coefficient 0e0 instead of erroring (rank guard); a singular reduced
+--      Gram also falls back to all-zero coefficients (BFGS recovers).
+--   3. Hannan-Rissanen exactly like v1 on the complete-case residuals: rows
+--      whose full lag window touches a missing residual are excluded from
+--      both regressions (the v1 named minimum-length failure is kept, on the
+--      differenced-timeline length n - kdiff).
+--   4. sigma2_0 = mean squared stage-2 residual over the valid rows
+--      (fallbacks: mean non-missing w^2, then 1e0); NO sigma2 slot when conc.
+--   5. Shrink-until-valid via the conc-aware untransform (v1 semantics:
+--      the four ARMA blocks jointly scaled by 0.5^z, tau/beta untouched).
+CREATE OR REPLACE MACRO _sarimax_start_params_v2(y_tbl, exog_tbl, degs_tbl,
+                                                 r, p, q, bigp, bigq, s, d, sd,
+                                                 ktrend, conc) AS TABLE
+WITH _sarimax_sq_args AS (
+    SELECT (SELECT count(*) FROM query_table(y_tbl))::BIGINT AS zn,
+           _sarimax_kdiff(d, sd, s) AS zkd,
+           (ktrend + r)::BIGINT AS znreg
+),
+_sarimax_sq_dp AS (        -- (1-L)^d (1-L^s)^sd, constant term first
+    SELECT list_reduce(
+               list_prepend([1e0],
+                   list_transform(range(1, d + 1), lambda zi: [1e0, -1e0])
+                   || list_transform(range(1, sd + 1), lambda zi:
+                          list_prepend(1e0, list_append(
+                              list_transform(range(1, s), lambda zz: 0e0), -1e0)))),
+               lambda za, zb: _sarimax_polymul(za, zb)) AS zdp
+),
+_sarimax_sq_dpr AS (       -- polynomial as rows (zj 1-based, zv)
+    SELECT zu.zj::BIGINT AS zj, zdpp.zdp[zu.zj] AS zv
+    FROM _sarimax_sq_dp zdpp, LATERAL unnest(range(1, len(zdpp.zdp) + 1)) AS zu(zj)
+),
+_sarimax_sq_w AS (         -- differenced series, zt = 1..n-kd (NULL propagates)
+    SELECT (zw1.t - za.zkd)::BIGINT AS zt,
+           list_reduce(list_prepend(0e0, list(zr.zv * zw2.y ORDER BY zr.zj)),
+                       lambda zfa, zfb: zfa + zfb) AS zw
+    FROM _sarimax_sq_args za
+    CROSS JOIN query_table(y_tbl) zw1
+    JOIN _sarimax_sq_dpr zr ON true
+    JOIN query_table(y_tbl) zw2 ON zw2.t = zw1.t - zr.zj + 1
+    WHERE zw1.t > za.zkd
+    GROUP BY zw1.t, za.zkd
+),
+_sarimax_sq_base AS (      -- joint regressors, ORIGINAL timeline: trend | exog
+    SELECT zu.zt::BIGINT AS zt, zdgs.idx::BIGINT AS zc,
+           pow(zu.zt::DOUBLE, zdgs.degree) AS zx
+    FROM _sarimax_sq_args za2
+    CROSS JOIN LATERAL unnest(range(1, za2.zn + 1)) AS zu(zt)
+    CROSS JOIN query_table(degs_tbl) zdgs
+    UNION ALL
+    SELECT ze.t::BIGINT, (ktrend + ze.j)::BIGINT, ze.x
+    FROM query_table(exog_tbl) ze, _sarimax_sq_args za3
+    WHERE ze.t <= za3.zn
+),
+_sarimax_sq_xd AS (        -- differenced regressors on the w timeline
+    SELECT (zb.zt - za.zkd)::BIGINT AS zt, zb.zc,
+           list_reduce(list_prepend(0e0, list(zr.zv * zb2.zx ORDER BY zr.zj)),
+                       lambda zfa, zfb: zfa + zfb) AS zx
+    FROM _sarimax_sq_args za
+    CROSS JOIN _sarimax_sq_base zb
+    JOIN _sarimax_sq_dpr zr ON true
+    JOIN _sarimax_sq_base zb2 ON zb2.zc = zb.zc AND zb2.zt = zb.zt - zr.zj + 1
+    WHERE zb.zt > za.zkd
+    GROUP BY zb.zt, zb.zc, za.zkd
+),
+_sarimax_sq_cc AS (        -- complete-case rows for the OLS
+    SELECT zt FROM _sarimax_sq_w WHERE zw IS NOT NULL
+),
+_sarimax_sq_keep AS (      -- rank guard: drop annihilated columns
+    SELECT zx.zc,
+           list_reduce(list_prepend(0e0, list(zx.zx * zx.zx ORDER BY zx.zt)),
+                       lambda zfa, zfb: zfa + zfb) > 1e-12 AS zkeep
+    FROM _sarimax_sq_xd zx
+    JOIN _sarimax_sq_cc zk ON zk.zt = zx.zt
+    GROUP BY zx.zc
+),
+_sarimax_sq_cmap AS (      -- kept columns -> dense 1..nk
+    SELECT zc, row_number() OVER (ORDER BY zc) AS zcd
+    FROM _sarimax_sq_keep WHERE zkeep
+),
+_sarimax_sq_nk AS (
+    SELECT count(*)::BIGINT AS znk FROM _sarimax_sq_cmap
+),
+_sarimax_sq_bk AS (        -- OLS over kept columns, complete cases; zeros fallback
+    SELECT CASE WHEN znkc.znk = 0 THEN []::DOUBLE[]
+                WHEN NOT (zs.zsol).ok
+                THEN list_transform(range(1, znkc.znk + 1), lambda zz2: 0e0)
+                ELSE (zs.zsol).x END AS zbk
+    FROM _sarimax_sq_nk znkc,
+         (SELECT _sarimax_solve_list(zg.zaug, zni.znk, 1) AS zsol
+          FROM _sarimax_sq_nk zni,
+               (SELECT list(zv ORDER BY zj1, zj2) AS zaug
+                FROM (
+                    SELECT zma.zcd AS zj1, zmb.zcd AS zj2,
+                           list_reduce(list_prepend(0e0, list(za.zx * zb.zx ORDER BY za.zt)),
+                                       lambda zfa, zfb: zfa + zfb) AS zv
+                    FROM _sarimax_sq_xd za
+                    JOIN _sarimax_sq_cc zk1 ON zk1.zt = za.zt
+                    JOIN _sarimax_sq_xd zb ON zb.zt = za.zt
+                    JOIN _sarimax_sq_cmap zma ON zma.zc = za.zc
+                    JOIN _sarimax_sq_cmap zmb ON zmb.zc = zb.zc
+                    GROUP BY zma.zcd, zmb.zcd
+                    UNION ALL
+                    SELECT zma.zcd, znx.znk + 1,
+                           list_reduce(list_prepend(0e0, list(za.zx * zw.zw ORDER BY za.zt)),
+                                       lambda zfa, zfb: zfa + zfb)
+                    FROM _sarimax_sq_xd za
+                    JOIN _sarimax_sq_w zw ON zw.zt = za.zt AND zw.zw IS NOT NULL
+                    JOIN _sarimax_sq_cmap zma ON zma.zc = za.zc
+                    CROSS JOIN _sarimax_sq_nk znx
+                    GROUP BY zma.zcd, znx.znk
+                )) zg) zs
+),
+_sarimax_sq_bf AS (        -- full-length joint (tau | beta), zeros on dropped cols
+    -- scalar-subquery form: MUST yield exactly one row even when znreg = 0
+    -- (a GROUP BY over the empty column join would yield zero rows and
+    -- silently empty every downstream CTE)
+    SELECT coalesce((
+        SELECT list(CASE WHEN zm.zcd IS NULL THEN 0e0
+                         ELSE zbkc.zbk[zm.zcd] END ORDER BY zcs.zc)
+        FROM _sarimax_sq_args za
+        CROSS JOIN LATERAL unnest(range(1, za.znreg + 1)) AS zcs(zc)
+        LEFT JOIN _sarimax_sq_cmap zm ON zm.zc = zcs.zc
+        CROSS JOIN _sarimax_sq_bk zbkc
+    ), []::DOUBLE[]) AS zbf
+),
+_sarimax_sq_e AS (         -- OLS residuals on the w timeline (NULL where w NULL)
+    SELECT zw.zt, zw.zw - coalesce(zfit.zd, 0e0) AS zev
+    FROM _sarimax_sq_w zw
+    LEFT JOIN (
+        SELECT zx.zt, list_reduce(list_prepend(0e0, list(zx.zx * zbf.zbf[zx.zc] ORDER BY zx.zc)),
+                                  lambda za3, zb3: za3 + zb3) AS zd
+        FROM _sarimax_sq_xd zx, _sarimax_sq_bf zbf
+        GROUP BY zx.zt, zbf.zbf
+    ) zfit ON zfit.zt = zw.zt
+),
+_sarimax_sq_dims AS (
+    SELECT (za.zn - za.zkd)::BIGINT AS zne,
+           CASE WHEN q + bigq = 0 THEN 0::BIGINT
+                ELSE least(greatest(20, 2 * greatest(p + s * bigp, q + s * bigq))::BIGINT,
+                           (za.zn - za.zkd - 1) // 2) END AS zm,
+           (p + q + bigp + bigq)::BIGINT AS zncoef2
+    FROM _sarimax_sq_args za
+),
+_sarimax_sq_dims3 AS (
+    SELECT zne, zm, zncoef2,
+           CASE WHEN zncoef2 > 0 AND zne < zt0raw + zncoef2
+                THEN error(concat('duckARIMA v2 start values: n_eff = ', zne,
+                                  ' (model scale) is too small for the Hannan-Rissanen',
+                                  ' stage-2 regression; need n_eff >= ', zt0raw + zncoef2,
+                                  ' (long-AR order m = ', zm, ')'))
+                ELSE zt0raw END AS zt0
+    FROM (
+        SELECT zne, zm, zncoef2,
+               greatest(p + s * bigp + 1,
+                        CASE WHEN q + bigq > 0 THEN zm + 1 + q + s * bigq ELSE 1 END)::BIGINT AS zt0raw
+        FROM _sarimax_sq_dims
+    )
+),
+_sarimax_sq_d1ok AS (      -- long-AR rows whose FULL lag window is non-missing
+    SELECT ze1.zt
+    FROM _sarimax_sq_e ze1, _sarimax_sq_dims3 zd3
+    WHERE ze1.zt > zd3.zm AND ze1.zev IS NOT NULL
+      AND (SELECT count(*) FROM _sarimax_sq_e zi
+           WHERE zi.zt >= ze1.zt - zd3.zm AND zi.zt < ze1.zt
+             AND zi.zev IS NOT NULL) = zd3.zm
+),
+_sarimax_sq_d1 AS (        -- long-AR design over the valid rows
+    SELECT ze1.zt, zlx.zl, ze2.zev AS zx
+    FROM _sarimax_sq_e ze1
+    JOIN _sarimax_sq_d1ok zok ON zok.zt = ze1.zt
+    CROSS JOIN _sarimax_sq_dims3 zd3
+    CROSS JOIN LATERAL (SELECT zu.zl FROM unnest(range(1, zd3.zm + 1)) AS zu(zl)) zlx
+    JOIN _sarimax_sq_e ze2 ON ze2.zt = ze1.zt - zlx.zl
+),
+_sarimax_sq_a1 AS (        -- long-AR coefficients (zeros fallback)
+    SELECT CASE WHEN zd3.zm = 0 THEN []::DOUBLE[]
+                WHEN NOT (zs1.zsol).ok
+                THEN list_transform(range(1, zd3.zm + 1), lambda zz3: 0e0)
+                ELSE (zs1.zsol).x END AS za1
+    FROM _sarimax_sq_dims3 zd3,
+         (SELECT _sarimax_solve_list(zg1.zaug, zdi.zm, 1) AS zsol
+          FROM _sarimax_sq_dims3 zdi,
+               (SELECT list(zv ORDER BY zj1, zj2) AS zaug
+                FROM (
+                    SELECT za.zl AS zj1, zb.zl AS zj2,
+                           list_reduce(list_prepend(0e0, list(za.zx * zb.zx ORDER BY za.zt)),
+                                       lambda zfa, zfb: zfa + zfb) AS zv
+                    FROM _sarimax_sq_d1 za JOIN _sarimax_sq_d1 zb ON za.zt = zb.zt
+                    GROUP BY za.zl, zb.zl
+                    UNION ALL
+                    SELECT za.zl, zmx.zm + 1,
+                           list_reduce(list_prepend(0e0, list(za.zx * ze.zev ORDER BY za.zt)),
+                                       lambda zfa, zfb: zfa + zfb)
+                    FROM _sarimax_sq_d1 za
+                    JOIN _sarimax_sq_e ze ON ze.zt = za.zt
+                    CROSS JOIN _sarimax_sq_dims3 zmx
+                    GROUP BY za.zl, zmx.zm
+                )) zg1) zs1
+),
+_sarimax_sq_eps AS (       -- epshat on the VALID long-AR rows only
+    SELECT ze1.zt, ze1.zev - coalesce(zli.zsum, 0e0) AS zeps
+    FROM _sarimax_sq_e ze1
+    JOIN _sarimax_sq_d1ok zok ON zok.zt = ze1.zt
+    LEFT JOIN (
+        SELECT za.zt, list_reduce(
+                   list_prepend(0e0, list(za.zx * za1c.za1[za.zl] ORDER BY za.zl)),
+                   lambda za4, zb4: za4 + zb4) AS zsum
+        FROM _sarimax_sq_d1 za, _sarimax_sq_a1 za1c
+        GROUP BY za.zt, za1c.za1
+    ) zli ON zli.zt = ze1.zt
+),
+_sarimax_sq_cols AS (      -- stage-2 column spec, canonical block layout
+    SELECT zcx.zc,
+           CASE WHEN zcx.zc <= p + bigp THEN 1 ELSE 2 END AS zsrc,
+           CASE WHEN zcx.zc <= p THEN zcx.zc
+                WHEN zcx.zc <= p + bigp THEN (zcx.zc - p) * s
+                WHEN zcx.zc <= p + bigp + q THEN zcx.zc - p - bigp
+                ELSE (zcx.zc - p - bigp - q) * s END AS zlag
+    FROM (SELECT unnest(range(1, p + q + bigp + bigq + 1)) AS zc) zcx
+),
+_sarimax_sq_d2ok AS (      -- stage-2 rows with every referenced cell present
+    SELECT zrow.zt
+    FROM (SELECT ze.zt, ze.zev FROM _sarimax_sq_e ze, _sarimax_sq_dims3 zd3
+          WHERE ze.zt >= zd3.zt0) zrow
+    CROSS JOIN _sarimax_sq_cols zc
+    LEFT JOIN _sarimax_sq_e zej ON zc.zsrc = 1 AND zej.zt = zrow.zt - zc.zlag
+    LEFT JOIN _sarimax_sq_eps zpj ON zc.zsrc = 2 AND zpj.zt = zrow.zt - zc.zlag
+    WHERE zrow.zev IS NOT NULL
+    GROUP BY zrow.zt
+    HAVING count(*) FILTER (WHERE (zc.zsrc = 1 AND zej.zev IS NULL)
+                                  OR (zc.zsrc = 2 AND zpj.zeps IS NULL)) = 0
+    UNION ALL
+    SELECT ze.zt                    -- no ARMA columns: every non-missing row
+    FROM _sarimax_sq_e ze, _sarimax_sq_dims3 zd3
+    WHERE zd3.zncoef2 = 0 AND ze.zt >= zd3.zt0 AND ze.zev IS NOT NULL
+),
+_sarimax_sq_d2 AS (        -- stage-2 design over the valid rows
+    SELECT zok.zt, zc.zc, CASE WHEN zc.zsrc = 1 THEN zej.zev ELSE zpj.zeps END AS zx
+    FROM _sarimax_sq_d2ok zok
+    CROSS JOIN _sarimax_sq_cols zc
+    LEFT JOIN _sarimax_sq_e zej ON zc.zsrc = 1 AND zej.zt = zok.zt - zc.zlag
+    LEFT JOIN _sarimax_sq_eps zpj ON zc.zsrc = 2 AND zpj.zt = zok.zt - zc.zlag
+),
+_sarimax_sq_coef AS (      -- stage-2 coefficients in COLUMN order (phi,Phi,theta,Theta)
+    SELECT CASE WHEN p + q + bigp + bigq = 0 THEN []::DOUBLE[]
+                WHEN NOT (zs2.zsol).ok
+                THEN list_transform(range(1, p + q + bigp + bigq + 1), lambda zz4: 0e0)
+                ELSE (zs2.zsol).x END AS zcoef
+    FROM (SELECT _sarimax_solve_list(
+                     (SELECT list(zv ORDER BY zj1, zj2)
+                      FROM (
+                          SELECT za.zc::BIGINT AS zj1, zb.zc::BIGINT AS zj2,
+                                 list_reduce(list_prepend(0e0, list(za.zx * zb.zx ORDER BY za.zt)),
+                                             lambda zfa, zfb: zfa + zfb) AS zv
+                          FROM _sarimax_sq_d2 za JOIN _sarimax_sq_d2 zb ON za.zt = zb.zt
+                          GROUP BY za.zc, zb.zc
+                          UNION ALL
+                          SELECT za.zc::BIGINT, (p + q + bigp + bigq + 1)::BIGINT,
+                                 list_reduce(list_prepend(0e0, list(za.zx * ze.zev ORDER BY za.zt)),
+                                             lambda zfa, zfb: zfa + zfb)
+                          FROM _sarimax_sq_d2 za JOIN _sarimax_sq_e ze ON ze.zt = za.zt
+                          GROUP BY za.zc
+                      )),
+                     p + q + bigp + bigq, 1) AS zsol) zs2
+),
+_sarimax_sq_sig AS (
+    SELECT CASE WHEN zsg.zs2v IS NOT NULL AND isfinite(zsg.zs2v) AND zsg.zs2v > 0e0 THEN zsg.zs2v
+                WHEN zwv.zvw IS NOT NULL AND isfinite(zwv.zvw) AND zwv.zvw > 0e0 THEN zwv.zvw
+                ELSE 1e0 END AS zsig2
+    FROM (
+        SELECT list_reduce(list_prepend(0e0, list(zres * zres ORDER BY zt)),
+                           lambda zfa, zfb: zfa + zfb) / greatest(count(*), 1) AS zs2v
+        FROM (
+            SELECT ze.zt, ze.zev - coalesce(zfld.zsum, 0e0) AS zres
+            FROM _sarimax_sq_e ze
+            JOIN _sarimax_sq_d2ok zok ON zok.zt = ze.zt
+            LEFT JOIN (
+                SELECT za.zt, list_reduce(
+                           list_prepend(0e0, list(za.zx * zcf.zcoef[za.zc] ORDER BY za.zc)),
+                           lambda za5, zb5: za5 + zb5) AS zsum
+                FROM _sarimax_sq_d2 za, _sarimax_sq_coef zcf
+                GROUP BY za.zt, zcf.zcoef
+            ) zfld ON zfld.zt = ze.zt
+        )
+    ) zsg,
+    (SELECT list_reduce(list_prepend(0e0, list(zw * zw ORDER BY zt) FILTER (zw IS NOT NULL)),
+                        lambda zfa, zfb: zfa + zfb) / greatest(count(zw), 1) AS zvw
+     FROM _sarimax_sq_w) zwv
+),
+_sarimax_sq_pbase AS (     -- remap stage-2 columns to canonical order, guard finite
+    SELECT zbfc.zbf,
+           list_transform(range(1, p + q + bigp + bigq + 1), lambda zc5:
+               (list_transform([CASE WHEN zc5 <= p THEN zcf.zcoef[zc5]
+                                     WHEN zc5 <= p + q THEN zcf.zcoef[p + bigp + (zc5 - p)]
+                                     WHEN zc5 <= p + q + bigp THEN zcf.zcoef[p + (zc5 - p - q)]
+                                     ELSE zcf.zcoef[p + bigp + q + (zc5 - p - q - bigp)] END],
+                    lambda zv5: CASE WHEN coalesce(isfinite(zv5), false)
+                                     THEN zv5 ELSE 0e0 END))[1]) AS zarma,
+           zsg.zsig2
+    FROM _sarimax_sq_bf zbfc, _sarimax_sq_coef zcf, _sarimax_sq_sig zsg
+),
+_sarimax_sq_pb2 AS (       -- rescale tau by the AR DC gain: the OLS estimates
+    -- observation-scale trend coefficients, but tau drives the STATE
+    -- intercept, whose stationary observation effect is tau / phi*(1) --
+    -- so tau0 = lambda_OLS * (1 - sum phi)(1 - sum Phi). beta (exog) enters
+    -- the observation equation directly and is NOT rescaled. Guarded to 1
+    -- when the gain is tiny or non-finite.
+    SELECT list_transform(range(1, len(zbf) + 1), lambda zc7:
+               CASE WHEN zc7 <= ktrend THEN zbf[zc7] * zgadj ELSE zbf[zc7] END) AS zbf,
+           zarma, zsig2
+    FROM (
+        SELECT zbf, zarma, zsig2,
+               (list_transform([(1e0 - list_reduce(
+                                     list_prepend(0e0, list_slice(zarma, 1, p)),
+                                     lambda za7, zb7: za7 + zb7))
+                                * (1e0 - list_reduce(
+                                       list_prepend(0e0, list_slice(zarma, p + q + 1,
+                                                                    p + q + bigp)),
+                                       lambda za8, zb8: za8 + zb8))],
+                   lambda zg: CASE WHEN coalesce(isfinite(zg), false) AND abs(zg) > 1e-6
+                                   THEN zg ELSE 1e0 END))[1] AS zgadj
+        FROM _sarimax_sq_pbase
+    )
+),
+_sarimax_sq_pick AS (      -- shrink-until-valid, smallest z wins
+    SELECT zshrink, zcand, zx0c
+    FROM (
+        SELECT zz.zshrink,
+               zb6.zbf
+                 || list_transform(zb6.zarma, lambda za6: za6 * power(5e-1, zz.zshrink))
+                 || (CASE WHEN conc THEN []::DOUBLE[] ELSE [zb6.zsig2] END) AS zcand,
+               TRY(_sarimax_untransform_params_v2(
+                       zb6.zbf
+                         || list_transform(zb6.zarma, lambda za6: za6 * power(5e-1, zz.zshrink))
+                         || (CASE WHEN conc THEN []::DOUBLE[] ELSE [zb6.zsig2] END),
+                       ktrend + r, p, q, bigp, bigq, conc)) AS zx0c
+        FROM _sarimax_sq_pb2 zb6, unnest(range(0, 61)) AS zz(zshrink)
+    )
+    WHERE zx0c IS NOT NULL
+      AND len(list_filter(zx0c, lambda ze6: coalesce(isfinite(ze6), false))) = len(zx0c)
+      AND len(zx0c) = ktrend + r + p + q + bigp + bigq
+                      + CASE WHEN conc THEN 0 ELSE 1 END
+    ORDER BY zshrink
+    LIMIT 1
+)
+SELECT CASE WHEN zp.zx0c IS NULL
+            THEN error('duckARIMA v2 start values: no stationary/invertible starting point found')
+            ELSE zp.zx0c END AS x0,
+       zp.zcand AS params0
+FROM (SELECT 1 AS zone) zdum
+LEFT JOIN _sarimax_sq_pick zp ON true;
+
+-- ---- 3d. BFGS optimizer (v2 objective; v1 section 2c pinned constants) ---------
+
+-- Structural mirror of _sarimax_bfgs (section 2c) -- same two-phase lazy
+-- Armijo line search, central-difference gradients, BFGS update with the
+-- y's-guard, the two documented noise-floor stall certificates, and the
+-- single hash-perturbed restart -- with the objective
+-- f(x) = -(_sarimax_ll_x_v2(...)).ll over the v2 unconstrained space
+-- (np = ktrend + r + p + q + bigp + bigq + (conc ? 0 : 1)). ylist (column y,
+-- with NULLs), UNdifferenced exog and the degs table are precomputed ONCE
+-- into columns (zwl / zxm / zdg) and pre-projected into every innermost
+-- derived table that evaluates the kernel (the correlated-LATERAL lambda
+-- rule, section 2 header). Output adds scale2 (the concentrated scale at the
+-- optimum when conc, else the fitted sigma2 parameter).
+--
+-- DOCUMENTED DEVIATION (kdiff-aware gradient step): h_i = 1e-7 *
+-- max(1, |x_i|) exactly as v1 when kdiff = 0, but 1e-5 * max(1, |x_i|) when
+-- kdiff > 0. The approximate-diffuse kappa = 1e6 initialization makes the
+-- loglikelihood rough at the ~1e-7 ABSOLUTE level along ARMA/sigma2
+-- coordinates on nodiff_sarimax_011_011_12 (measured: quadratic-fit
+-- residuals over 1e-8-spaced samples); central differences at h = 1e-7 turn
+-- that into gradient noise of ORDER ONE, which corrupts the BFGS curvature
+-- pairs and stalls the line search at points whose true gradient is still
+-- ~0.5 (verified: h = 1e-5 finite differences at the h = 1e-7 stall point
+-- recover the true gradient, and a reference BFGS run using them descends a
+-- further 1.9e-3 in ll, ending ABOVE statsmodels' reported optimum). At
+-- h = 1e-5 the gradient noise is ~1e-2 and the truncation error stays below
+-- ~1e-4 on every fixture coordinate.
+--
+-- DOCUMENTED DEVIATION (restarted-exhaustion certificate, kdiff > 0 only):
+-- after the hash-perturbed restart has already happened, a SECOND
+-- line-search exhaustion (31 rejected candidates down to alpha = 2^-30 at
+-- two independent points) certifies convergence regardless of the reported
+-- gradient, which at the diffuse noise floor is uninformative (see above);
+-- the acceptance suite separately asserts the endpoint's ll >= statsmodels'
+-- ll - 1e-8 through the T1-validated kernel, which is the substantive gate.
+-- The FIRST exhaustion still restarts, preserving the second-opinion probe.
+--
+-- DOCUMENTED DEVIATION (stall-certificate gradient ceiling 1e-2, was 1e-4 in
+-- v1): v2 surfaces mix near-collinear regressors (a trend term plus an exog
+-- column that itself carries a trend, kitchen_sink) with extreme curvature
+-- anisotropy -- the drift coordinate's second derivative is ~1e6, so the
+-- smallest gradient any float64 optimizer can REACH there is about
+-- sqrt(2 * f'' * eps|f|) ~ 4e-4: positioning the coordinate more finely
+-- changes f by less than evaluation noise. Measured on kitchen_sink at this
+-- engine's stall point (ll BETTER than statsmodels' reported optimum by
+-- 1.4e-2, and within 1.8e-8 of a 20k-step Nelder-Mead valley floor):
+-- scipy's own BFGS aborts there with "precision loss" at |g|inf = 8.6e-2,
+-- and statsmodels' reported optimum carries |g|inf = 11.6 through the same
+-- loglikelihood. The certificates still fire ONLY on line-search exhaustion
+-- (31 rejected candidates down to alpha = 2^-30) or a
+-- machine-epsilon-flat accepted step, and the acceptance suite separately
+-- asserts ll >= statsmodels' ll - 1e-8 at the endpoint.
+CREATE OR REPLACE MACRO _sarimax_bfgs_v2(y_tbl, exog_tbl, degs_tbl,
+                                         r, p, q, bigp, bigq, s, d, sd,
+                                         ktrend, conc) AS TABLE
+WITH RECURSIVE
+_sarimax_bf2_pc AS (
+    SELECT (SELECT list(y ORDER BY t) FROM query_table(y_tbl)) AS zwl,
+           coalesce((SELECT list(zxr ORDER BY t)
+                     FROM (SELECT t, list(x ORDER BY j) AS zxr
+                           FROM query_table(exog_tbl) GROUP BY t)),
+                    []::DOUBLE[][]) AS zxm,
+           (SELECT coalesce(list(degree ORDER BY idx), []::BIGINT[])
+            FROM query_table(degs_tbl)) AS zdg,
+           (ktrend + r + p + q + bigp + bigq
+            + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp,
+           zsp.x0 AS zx0
+    FROM _sarimax_start_params_v2(y_tbl, exog_tbl, degs_tbl,
+                                  r, p, q, bigp, bigq, s, d, sd, ktrend, conc) zsp
+),
+_sarimax_bf2_it USING KEY (zkk) AS (
+    -- ---------------- anchor: f and gradient at x0 ----------------
+    SELECT 1::INT AS zkk, 0::INT AS ziter,
+           za2.zx AS zx, za2.zfx AS zfx, za2.zg_new AS zgx,
+           list_transform(range(1, za2.znp * za2.znp + 1), lambda zidx:
+               CASE WHEN (zidx - 1) // za2.znp = (zidx - 1) % za2.znp THEN 1e0 ELSE 0e0 END) AS zhinv,
+           CASE WHEN za2.zg_new IS NULL
+                     OR len(list_filter(za2.zg_new, lambda ze: ze IS NULL)) > 0 THEN 3
+                WHEN list_reduce(list_prepend(0e0, list_transform(za2.zg_new, lambda ze: abs(ze))),
+                                 lambda za, zb: greatest(za, zb)) <= 1e-9 THEN 1
+                ELSE 0 END AS zstatus,
+           false AS zrestarted, 0::INT AS zlsf
+    FROM (
+        SELECT za1.*,
+               list_transform(range(1, za1.znp + 1), lambda zi:
+                   (za1.zfpm[2 * zi - 1] - za1.zfpm[2 * zi])
+                   / (2e0 * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(za1.zx[zi])))) AS zg_new
+        FROM (
+            SELECT zpc.zx0 AS zx, zpc.znp,
+                   0e0 - (_sarimax_ll_x_v2(zpc.zx0, zpc.zwl, zpc.zxm, zpc.zdg,
+                                           r, p, q, bigp, bigq, s, d, sd,
+                                           ktrend, conc)).ll AS zfx,
+                   zag.zfpm
+            FROM _sarimax_bf2_pc zpc
+            CROSS JOIN LATERAL (
+                SELECT list(zval ORDER BY zidx) AS zfpm
+                FROM (
+                    SELECT zidx,
+                           0e0 - (_sarimax_ll_x_v2(
+                               list_transform(zxc, lambda zxe, zxi:
+                                   CASE WHEN zxi = (zidx + 1) // 2
+                                        THEN zxe + (CASE WHEN zidx % 2 = 1 THEN 1e0 ELSE -1e0 END)
+                                                   * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(zxe))
+                                        ELSE zxe END),
+                               zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
+                               ktrend, conc)).ll AS zval
+                    FROM (SELECT zpc.zx0 AS zxc, zpc.zwl AS zwlc, zpc.zxm AS zxmc,
+                                 zpc.zdg AS zdgc, zu.zidx
+                          FROM unnest(range(1, 2 * zpc.znp + 1)) AS zu(zidx))
+                )
+            ) zag
+        ) za1
+    ) za2
+
+    UNION ALL
+
+    -- ---------------- one BFGS iteration ----------------
+    SELECT zfin.zkk,
+           CASE WHEN zfin.zrestart_ls OR zfin.zrestart2 THEN 0 ELSE zfin.zniter END AS ziter,
+           CASE WHEN zfin.zterminal_ls OR zfin.zstall_ls OR zfin.zgterm THEN zfin.zx
+                WHEN zfin.zrestart_ls THEN zfin.zx_eval
+                WHEN zfin.zrestart2 THEN zfin.zx_r
+                ELSE zfin.zx_new END AS zx,
+           CASE WHEN zfin.zterminal_ls OR zfin.zstall_ls OR zfin.zgterm THEN zfin.zfx
+                WHEN zfin.zrestart_ls THEN zfin.zfe
+                WHEN zfin.zrestart2 THEN zfin.zf2
+                ELSE zfin.zfe END AS zfx,
+           CASE WHEN zfin.zterminal_ls OR zfin.zstall_ls OR zfin.zgterm THEN zfin.zgx
+                WHEN zfin.zrestart_ls THEN zfin.zg_new
+                WHEN zfin.zrestart2 THEN zfin.zg2
+                ELSE zfin.zg_new END AS zgx,
+           CASE WHEN zfin.zrestart_ls OR zfin.zrestart2
+                THEN list_transform(range(1, zfin.znp * zfin.znp + 1), lambda zidx:
+                         CASE WHEN (zidx - 1) // zfin.znp = (zidx - 1) % zfin.znp
+                              THEN 1e0 ELSE 0e0 END)
+                WHEN zfin.zstatus_new = 0 AND NOT zfin.zskip THEN zfin.zhup
+                ELSE zfin.zhinv END AS zhinv,
+           zfin.zstatus_new AS zstatus,
+           (zfin.zrestarted OR zfin.zrestart_ls OR zfin.zrestart2) AS zrestarted,
+           zfin.zlsf + CASE WHEN zfin.zls_fail OR (zfin.zgnull AND zfin.zls_ok)
+                            THEN 1 ELSE 0 END AS zlsf
+    FROM (
+        SELECT zs9.*,
+               CASE WHEN zs9.zterminal_ls THEN 3
+                    WHEN zs9.zstall_ls THEN 1
+                    WHEN zs9.zrestart_ls THEN CASE WHEN zs9.zgnull THEN 3 ELSE 0 END
+                    WHEN zs9.zrestart2 THEN CASE WHEN zs9.zgnull2 THEN 3 ELSE 0 END
+                    WHEN zs9.zgterm THEN 3
+                    WHEN zs9.zconv OR zs9.zstall_f THEN 1
+                    WHEN zs9.zniter >= 500 THEN 2
+                    ELSE 0 END AS zstatus_new
+        FROM (
+            SELECT zs8.*,
+                   CASE WHEN zs8.zskip0 THEN NULL ELSE
+                       _sarimax_madd(
+                           _sarimax_mmul(zs8.zhalf, zs8.zat, zs8.znp, zs8.znp, zs8.znp),
+                           list_transform(range(1, zs8.znp * zs8.znp + 1), lambda zidx:
+                               (1e0 / zs8.zsy) * zs8.zsv[(zidx - 1) // zs8.znp + 1]
+                                               * zs8.zsv[(zidx - 1) % zs8.znp + 1])) END AS zhup,
+                   zs8.zskip0 AS zskip
+            FROM (
+                SELECT zs7.*,
+                       CASE WHEN zs7.zskip0 THEN NULL
+                            ELSE _sarimax_mmul(zs7.zam, zs7.zhinv,
+                                               zs7.znp, zs7.znp, zs7.znp) END AS zhalf
+                FROM (
+                    SELECT zs6.*,
+                           CASE WHEN zs6.zskip0 THEN NULL ELSE
+                               list_transform(range(1, zs6.znp * zs6.znp + 1), lambda zidx:
+                                   (CASE WHEN (zidx - 1) // zs6.znp = (zidx - 1) % zs6.znp
+                                         THEN 1e0 ELSE 0e0 END)
+                                   - (1e0 / zs6.zsy) * zs6.zsv[(zidx - 1) // zs6.znp + 1]
+                                                     * zs6.zyv[(zidx - 1) % zs6.znp + 1]) END AS zam,
+                           CASE WHEN zs6.zskip0 THEN NULL ELSE
+                               list_transform(range(1, zs6.znp * zs6.znp + 1), lambda zidx:
+                                   (CASE WHEN (zidx - 1) // zs6.znp = (zidx - 1) % zs6.znp
+                                         THEN 1e0 ELSE 0e0 END)
+                                   - (1e0 / zs6.zsy) * zs6.zyv[(zidx - 1) // zs6.znp + 1]
+                                                     * zs6.zsv[(zidx - 1) % zs6.znp + 1]) END AS zat
+                    FROM (
+                        SELECT zs5b.*,
+                               CASE WHEN zs5b.zsy IS NULL
+                                         OR NOT (zs5b.zsy > 1e-10 * sqrt(zs5b.zyy) * sqrt(zs5b.zss))
+                                    THEN true ELSE false END AS zskip0
+                        FROM (
+                            SELECT zs5.*,
+                                   list_reduce(list_prepend(0e0, list_transform(range(1, zs5.znp + 1),
+                                       lambda zi: zs5.zyv[zi] * zs5.zsv[zi])),
+                                       lambda za, zb: za + zb) AS zsy,
+                                   list_reduce(list_prepend(0e0, list_transform(range(1, zs5.znp + 1),
+                                       lambda zi: zs5.zyv[zi] * zs5.zyv[zi])),
+                                       lambda za, zb: za + zb) AS zyy,
+                                   list_reduce(list_prepend(0e0, list_transform(range(1, zs5.znp + 1),
+                                       lambda zi: zs5.zsv[zi] * zs5.zsv[zi])),
+                                       lambda za, zb: za + zb) AS zss
+                            FROM (
+                                SELECT zs4b.*,
+                                       zs4b.zrestart2 AND (zs4b.zg2 IS NULL
+                                           OR len(list_filter(zs4b.zg2, lambda ze: ze IS NULL)) > 0) AS zgnull2,
+                                       list_transform(zs4b.zx_new, lambda zxe, zxi:
+                                           zxe - zs4b.zx[zxi]) AS zsv,
+                                       list_transform(zs4b.zg_new, lambda zge, zgi:
+                                           zge - zs4b.zgx[zgi]) AS zyv
+                                FROM (
+                                    SELECT zs4a.*,
+                                           CASE WHEN zs4a.zn2 = 0 THEN NULL ELSE
+                                               list_transform(range(1, zs4a.znp + 1), lambda zi:
+                                                   (zs4a.zfpm2[2 * zi - 1] - zs4a.zfpm2[2 * zi])
+                                                   / (2e0 * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(zs4a.zx_r[zi]))))
+                                           END AS zg2
+                                    FROM (
+                                        SELECT zs4.*, zbb2.zf2, zbb2.zfpm2, zbb2.zn2
+                                        FROM (
+                                            SELECT zs3g.*,
+                                                   zs3g.zls_ok AND NOT zs3g.zrestarted
+                                                     AND (zs3g.zgnull
+                                                          OR (NOT (zs3g.zconv OR zs3g.zstall_f)
+                                                              AND zs3g.zniter >= 500)) AS zrestart2,
+                                                   zs3g.zls_ok AND zs3g.zgnull
+                                                     AND zs3g.zrestarted AS zgterm,
+                                                   list_transform(
+                                                       CASE WHEN zs3g.zgnull THEN zs3g.zx
+                                                            ELSE zs3g.zx_new END,
+                                                       lambda zxe, zxi:
+                                                           zxe + ((hash(zxi) % 2001) / 1e3 - 1e0)
+                                                                 * 1e-1) AS zx_r
+                                            FROM (
+                                                SELECT zs3f.*,
+                                                       (zs3f.zg_new IS NULL
+                                                        OR len(list_filter(zs3f.zg_new,
+                                                               lambda ze: ze IS NULL)) > 0) AS zgnull,
+                                                       CASE WHEN zs3f.zg_new IS NOT NULL
+                                                                 AND len(list_filter(zs3f.zg_new,
+                                                                         lambda ze: ze IS NULL)) = 0
+                                                                 AND list_reduce(
+                                                                       list_prepend(0e0,
+                                                                           list_transform(zs3f.zg_new,
+                                                                               lambda ze: abs(ze))),
+                                                                       lambda za, zb: greatest(za, zb))
+                                                                     <= 1e-9
+                                                            THEN true ELSE false END AS zconv,
+                                                       -- stall certificate (b); v2 ceiling
+                                                       -- 1e-2 (header deviation note)
+                                                       CASE WHEN zs3f.zls_ok
+                                                                 AND zs3f.zg_new IS NOT NULL
+                                                                 AND len(list_filter(zs3f.zg_new,
+                                                                         lambda ze: ze IS NULL)) = 0
+                                                                 AND list_reduce(
+                                                                       list_prepend(0e0,
+                                                                           list_transform(zs3f.zg_new,
+                                                                               lambda ze: abs(ze))),
+                                                                       lambda za, zb: greatest(za, zb))
+                                                                     <= 1e-2
+                                                                 AND abs(zs3f.zfe - zs3f.zfx)
+                                                                     <= 7.105427357601002e-15
+                                                                        * greatest(1e0, abs(zs3f.zfx))
+                                                            THEN true ELSE false END AS zstall_f
+                                                FROM (
+                                                    SELECT zs3x.*,
+                                                           CASE WHEN zs3x.zfpm IS NULL THEN NULL ELSE
+                                                               list_transform(range(1, zs3x.znp + 1),
+                                                                   lambda zi:
+                                                                       (zs3x.zfpm[2 * zi - 1]
+                                                                        - zs3x.zfpm[2 * zi])
+                                                                       / (2e0 * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0,
+                                                                              abs(zs3x.zx_eval[zi]))))
+                                                           END AS zg_new,
+                                                           CASE WHEN zs3x.zls_ok THEN (zs3x.zbest).zf
+                                                                ELSE zs3x.zfe_c END AS zfe
+                                                    FROM (
+                                                        SELECT zs3.*, zbb1.zfpm, zbb1.zfe_c
+                                                        FROM (
+                                                            SELECT zs2.*,
+                                                                   CASE WHEN zs2.zls_ok
+                                                                        THEN list_transform(zs2.zx,
+                                                                                 lambda zxe, zxi:
+                                                                                     zxe + (zs2.zbest).za
+                                                                                           * zs2.zdir[zxi])
+                                                                        WHEN NOT zs2.zstall_ls
+                                                                             AND NOT zs2.zrestarted
+                                                                        THEN list_transform(zs2.zx,
+                                                                                 lambda zxe, zxi:
+                                                                                     zxe + ((hash(zxi) % 2001)
+                                                                                            / 1e3 - 1e0)
+                                                                                           * 1e-1)
+                                                                        ELSE NULL END AS zx_eval,
+                                                                   CASE WHEN zs2.zls_ok
+                                                                        THEN list_transform(zs2.zx,
+                                                                                 lambda zxe, zxi:
+                                                                                     zxe + (zs2.zbest).za
+                                                                                           * zs2.zdir[zxi])
+                                                                        END AS zx_new,
+                                                                   (NOT zs2.zls_ok)
+                                                                     AND NOT zs2.zstall_ls AS zls_fail,
+                                                                   (NOT zs2.zls_ok) AND NOT zs2.zstall_ls
+                                                                     AND NOT zs2.zrestarted AS zrestart_ls,
+                                                                   (NOT zs2.zls_ok) AND NOT zs2.zstall_ls
+                                                                     AND zs2.zrestarted AS zterminal_ls,
+                                                                   zs2.ziter + 1 AS zniter
+                                                            FROM (
+                                                                SELECT zs1b.*,
+                                                                       -- stall certificate (a); v2 ceiling
+                                                                       -- 1e-2 (header deviation note)
+                                                                       (zs1b.zbest IS NULL)
+                                                                         AND (zs1b.zgn_cur <= 1e-2
+                                                                              OR (d + s * sd > 0
+                                                                                  AND zs1b.zrestarted)) AS zstall_ls,
+                                                                       zs1b.zbest IS NOT NULL AS zls_ok
+                                                                FROM (
+                                                                    SELECT zs1.*,
+                                                                           coalesce(zs1.zbesta, zpb.zbestb) AS zbest
+                                                                    FROM (
+                                                                        SELECT zs0b.*, zpa.zbesta
+                                                                        FROM (
+                                                                            SELECT zs0.*,
+                                                                                   list_reduce(list_prepend(0e0,
+                                                                                       list_transform(range(1, zs0.znp + 1),
+                                                                                           lambda zi:
+                                                                                               zs0.zgx[zi] * zs0.zdir[zi])),
+                                                                                       lambda za, zb: za + zb) AS zgd,
+                                                                                   list_reduce(list_prepend(0e0,
+                                                                                       list_transform(zs0.zgx,
+                                                                                           lambda ze: abs(ze))),
+                                                                                       lambda za, zb: greatest(za, zb)) AS zgn_cur
+                                                                            FROM (
+                                                                                SELECT zit.zkk, zit.ziter, zit.zx, zit.zfx,
+                                                                                       zit.zgx, zit.zhinv, zit.zrestarted,
+                                                                                       zit.zlsf, zpc.znp, zpc.zwl, zpc.zxm,
+                                                                                       zpc.zdg,
+                                                                                       list_transform(range(1, zpc.znp + 1),
+                                                                                           lambda zi:
+                                                                                               -list_reduce(
+                                                                                                   list_prepend(0e0,
+                                                                                                       list_transform(range(1, zpc.znp + 1),
+                                                                                                           lambda zj:
+                                                                                                               zit.zhinv[(zi - 1) * zpc.znp + zj]
+                                                                                                               * zit.zgx[zj])),
+                                                                                                   lambda za, zb: za + zb)) AS zdir
+                                                                                FROM _sarimax_bf2_it zit, _sarimax_bf2_pc zpc
+                                                                                WHERE zit.zstatus = 0
+                                                                            ) zs0
+                                                                        ) zs0b
+                                                                        CROSS JOIN LATERAL (
+                                                                            SELECT max(CASE WHEN zfa IS NOT NULL
+                                                                                             AND zfa <= zfxc + 1e-4 * zalpha * zgdc
+                                                                                            THEN struct_pack(za := zalpha, zf := zfa)
+                                                                                       END) AS zbesta
+                                                                            FROM (
+                                                                                SELECT zfxc, zgdc,
+                                                                                       zalpha,
+                                                                                       0e0 - (_sarimax_ll_x_v2(
+                                                                                           list_transform(zxc, lambda zxe, zxi:
+                                                                                               zxe + zalpha * zdirc[zxi]),
+                                                                                           zwlc, zxmc, zdgc,
+                                                                                           r, p, q, bigp, bigq, s, d, sd,
+                                                                                           ktrend, conc)).ll AS zfa
+                                                                                FROM (SELECT zs0b.zx AS zxc, zs0b.zdir AS zdirc,
+                                                                                             zs0b.zfx AS zfxc, zs0b.zgd AS zgdc,
+                                                                                             zs0b.zwl AS zwlc, zs0b.zxm AS zxmc,
+                                                                                             zs0b.zdg AS zdgc,
+                                                                                             zua.zalpha
+                                                                                      FROM unnest([1e0, 5e-1, 25e-2]) AS zua(zalpha))
+                                                                            )
+                                                                        ) zpa
+                                                                    ) zs1
+                                                                    CROSS JOIN LATERAL (
+                                                                        SELECT max(CASE WHEN zfa IS NOT NULL
+                                                                                         AND zfa <= zfxc + 1e-4 * zalpha * zgdc
+                                                                                        THEN struct_pack(za := zalpha, zf := zfa)
+                                                                                   END) AS zbestb
+                                                                        FROM (
+                                                                            SELECT zfxc, zgdc, zalpha,
+                                                                                   0e0 - (_sarimax_ll_x_v2(
+                                                                                       list_transform(zxc, lambda zxe, zxi:
+                                                                                           zxe + zalpha * zdirc[zxi]),
+                                                                                       zwlc, zxmc, zdgc,
+                                                                                       r, p, q, bigp, bigq, s, d, sd,
+                                                                                       ktrend, conc)).ll AS zfa
+                                                                            FROM (SELECT zs1.zx AS zxc, zs1.zdir AS zdirc,
+                                                                                         zs1.zfx AS zfxc, zs1.zgd AS zgdc,
+                                                                                         zs1.zwl AS zwlc, zs1.zxm AS zxmc,
+                                                                                         zs1.zdg AS zdgc,
+                                                                                         zub.zalpha
+                                                                                  FROM unnest(CASE WHEN zs1.zbesta IS NULL
+                                                                                                   THEN list_transform(range(3, 31),
+                                                                                                            lambda zev: power(5e-1, zev))
+                                                                                                   ELSE []::DOUBLE[] END)
+                                                                                       AS zub(zalpha))
+                                                                        )
+                                                                    ) zpb
+                                                                ) zs1b
+                                                            ) zs2
+                                                        ) zs3
+                                                        CROSS JOIN LATERAL (
+                                                            -- batch 1: gradient (idx 1..2np) + center
+                                                            -- f (idx 0, restart path only) at x_eval
+                                                            SELECT list(zval ORDER BY zidx)
+                                                                       FILTER (WHERE zidx > 0) AS zfpm,
+                                                                   max(zval) FILTER (WHERE zidx = 0) AS zfe_c
+                                                            FROM (
+                                                                SELECT zidx,
+                                                                       0e0 - (_sarimax_ll_x_v2(
+                                                                           list_transform(zxc, lambda zxe, zxi:
+                                                                               CASE WHEN zidx > 0
+                                                                                         AND zxi = (zidx + 1) // 2
+                                                                                    THEN zxe + (CASE WHEN zidx % 2 = 1
+                                                                                                     THEN 1e0 ELSE -1e0 END)
+                                                                                               * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END)
+                                                                                               * greatest(1e0, abs(zxe))
+                                                                                    ELSE zxe END),
+                                                                           zwlc, zxmc, zdgc,
+                                                                           r, p, q, bigp, bigq, s, d, sd,
+                                                                           ktrend, conc)).ll AS zval
+                                                                FROM (SELECT zs3.zx_eval AS zxc,
+                                                                             zs3.zwl AS zwlc, zs3.zxm AS zxmc,
+                                                                             zs3.zdg AS zdgc,
+                                                                             zu.zidx
+                                                                      FROM unnest(CASE WHEN zs3.zterminal_ls
+                                                                                            OR zs3.zstall_ls
+                                                                                       THEN []::BIGINT[]
+                                                                                       WHEN zs3.zrestart_ls
+                                                                                       THEN range(0, 2 * zs3.znp + 1)
+                                                                                       ELSE range(1, 2 * zs3.znp + 1)
+                                                                                  END) AS zu(zidx))
+                                                            )
+                                                        ) zbb1
+                                                    ) zs3x
+                                                ) zs3f
+                                            ) zs3g
+                                        ) zs4
+                                        CROSS JOIN LATERAL (
+                                            -- batch 2: f + gradient at the perturbed restart point
+                                            -- (gated: rows exist only when restart-2 triggers)
+                                            SELECT max(zval) FILTER (WHERE zidx = 0) AS zf2,
+                                                   list(zval ORDER BY zidx) FILTER (WHERE zidx > 0) AS zfpm2,
+                                                   count(*) AS zn2
+                                            FROM (
+                                                SELECT zidx,
+                                                       0e0 - (_sarimax_ll_x_v2(
+                                                           list_transform(zxc, lambda zxe, zxi:
+                                                               CASE WHEN zidx > 0 AND zxi = (zidx + 1) // 2
+                                                                    THEN zxe + (CASE WHEN zidx % 2 = 1
+                                                                                     THEN 1e0 ELSE -1e0 END)
+                                                                               * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(zxe))
+                                                                    ELSE zxe END),
+                                                           zwlc, zxmc, zdgc,
+                                                           r, p, q, bigp, bigq, s, d, sd,
+                                                           ktrend, conc)).ll AS zval
+                                                FROM (SELECT zs4.zx_r AS zxc, zs4.zwl AS zwlc,
+                                                             zs4.zxm AS zxmc, zs4.zdg AS zdgc, zu.zidx
+                                                      FROM unnest(CASE WHEN zs4.zrestart2
+                                                                       THEN range(0, 2 * zs4.znp + 1)
+                                                                       ELSE []::BIGINT[] END) AS zu(zidx))
+                                            )
+                                        ) zbb2
+                                    ) zs4a
+                                ) zs4b
+                            ) zs5
+                        ) zs5b
+                    ) zs6
+                ) zs7
+            ) zs8
+        ) zs9
+    ) zfin
+)
+SELECT zit.zx AS x_opt,
+       _sarimax_transform_params_v2(zit.zx, ktrend + r, p, q, bigp, bigq, conc) AS params,
+       0e0 - zit.zfx AS loglik,
+       (_sarimax_ll_x_v2(zit.zx, zpc.zwl, zpc.zxm, zpc.zdg,
+                         r, p, q, bigp, bigq, s, d, sd, ktrend, conc)).scale2 AS scale2,
+       zit.zstatus = 1 AS converged,
+       zit.ziter AS iterations,
+       list_reduce(list_prepend(0e0, list_transform(zit.zgx, lambda ze: abs(ze))),
+                   lambda za, zb: greatest(za, zb)) AS grad_norm,
+       zit.zrestarted AS restarted,
+       zit.zlsf AS ls_failures
+FROM _sarimax_bf2_it zit, _sarimax_bf2_pc zpc;
+
+-- ---- 3e. standard errors (v2 objective; v1 section 2d semantics) ---------------
+
+-- One row (bse DOUBLE[]): constrained-space central-difference Hessian of the
+-- v2 LOGLIKELIHOOD at theta-hat, bse = sqrt(diag(inv(-H))) -- v1
+-- _sarimax_bse's exact batching, laziness and boundary step-halving, with the
+-- v2 kernel and np = ktrend + r + p + q + bigp + bigq + (conc ? 0 : 1).
+-- params / ylist / xmat / degs must be materialized values (section 2 header).
+--
+-- DOCUMENTED DEVIATION (kdiff-aware step size): h_i = 1e-4 *
+-- greatest(0.1, |theta_i|) exactly as v1 when kdiff = 0, but 1e-3 *
+-- greatest(0.1, |theta_i|) when kdiff > 0. The approximate-diffuse 1e6
+-- initialization leaves parameter-dependent quantization noise of ~1e-9 ..
+-- 1e-7 in the loglikelihood (see section 3 header); a second difference
+-- divides it by h^2, so the v1 step turns that noise into 1e-2-relative
+-- Hessian errors on the diffuse fixtures. A measured sweep (1e-4 .. 1e-2,
+-- tests/generate notes) puts the noise-vs-truncation optimum at 1e-3:
+-- kitchen_sink improves 1.3e-2 -> 4.8e-4 rel, nodiff_arima_111 1.3e-4 ->
+-- 1.5e-6, nodiff_sarimax_011_011_12 1.0e-1 -> 7.7e-3 (its floor; the
+-- acceptance gate for that fixture is 2e-2, everything else 1e-3).
+-- statsmodels sidesteps the noise with complex-step differentiation, which
+-- has no SQL equivalent.
+CREATE OR REPLACE MACRO _sarimax_bse_v2(params, ylist, xmat, degs,
+                                        r, p, q, bigp, bigq, s, d, sd,
+                                        ktrend, conc) AS TABLE
+WITH _sarimax_bs2_in0 AS (
+    SELECT params AS zc, ylist AS zwl, xmat AS zxm, degs AS zdg,
+           (ktrend + r + p + q + bigp + bigq
+            + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp
+),
+_sarimax_bs2_in AS (
+    SELECT zc, zwl, zxm, zdg, znp,
+           (_sarimax_ll_c_v2(zc, zwl, zxm, zdg, r, p, q, bigp, bigq, s, d, sd,
+                             ktrend, conc)).ll AS zf0
+    FROM _sarimax_bs2_in0
+),
+_sarimax_bs2_h AS (       -- adaptive per-coordinate steps
+    SELECT zin.zc, zin.zwl, zin.zxm, zin.zdg, zin.znp, zin.zf0, zhh.zhl
+    FROM _sarimax_bs2_in zin
+    CROSS JOIN LATERAL (
+        SELECT list(zh ORDER BY zi) AS zhl
+        FROM (
+            SELECT zi,
+                   (list_transform([(CASE WHEN d + s * sd > 0 THEN 1e-3 ELSE 1e-4 END)
+                                    * greatest(1e-1, abs(zcc[zi]))], lambda zh0:
+                        CASE WHEN (_sarimax_ll_c_v2(list_transform(zcc, lambda zv2, zi2:
+                                      CASE WHEN zi2 = zi THEN zv2 + zh0 ELSE zv2 END),
+                                      zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
+                                      ktrend, conc)).ll IS NOT NULL
+                                  AND (_sarimax_ll_c_v2(list_transform(zcc, lambda zv2, zi2:
+                                          CASE WHEN zi2 = zi THEN zv2 - zh0 ELSE zv2 END),
+                                          zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
+                                          ktrend, conc)).ll IS NOT NULL
+                             THEN zh0
+                             WHEN (_sarimax_ll_c_v2(list_transform(zcc, lambda zv2, zi2:
+                                      CASE WHEN zi2 = zi THEN zv2 + zh0 * 5e-1 ELSE zv2 END),
+                                      zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
+                                      ktrend, conc)).ll IS NOT NULL
+                                  AND (_sarimax_ll_c_v2(list_transform(zcc, lambda zv2, zi2:
+                                          CASE WHEN zi2 = zi THEN zv2 - zh0 * 5e-1 ELSE zv2 END),
+                                          zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
+                                          ktrend, conc)).ll IS NOT NULL
+                             THEN zh0 * 5e-1
+                             ELSE zh0 * 25e-2 END))[1] AS zh
+            FROM (SELECT zin.zc AS zcc, zin.zwl AS zwlc, zin.zxm AS zxmc,
+                         zin.zdg AS zdgc, zu.zi
+                  FROM unnest(range(1, zin.znp + 1)) AS zu(zi))
+        )
+    ) zhh
+),
+_sarimax_bs2_tri AS (     -- upper-triangle H cells, ordered (i, j), i <= j
+    SELECT zh2.zc, zh2.zwl, zh2.zxm, zh2.zdg, zh2.znp, zh2.zhl, zgr.ztri
+    FROM _sarimax_bs2_h zh2
+    CROSS JOIN LATERAL (
+        SELECT list(zhv ORDER BY zi, zj) AS ztri
+        FROM (
+            SELECT zi, zj,
+                   CASE WHEN zi = zj
+                        THEN (list_reduce(list_prepend(0e0, list(zfv ORDER BY zs1, zs2)),
+                                          lambda za7, zb7: za7 + zb7)
+                              - 2e0 * zf0c) / (zhlc[zi] * zhlc[zi])
+                        ELSE list_reduce(list_prepend(0e0,
+                                 list(zs1 * zs2 * zfv ORDER BY zs1, zs2)),
+                                 lambda za7, zb7: za7 + zb7)
+                             / (4e0 * zhlc[zi] * zhlc[zj]) END AS zhv
+            FROM (
+                SELECT zi, zj, zs1, zs2, zf0c, zhlc,
+                       (_sarimax_ll_c_v2(list_transform(zcc, lambda zv3, zk3:
+                               zv3 + CASE WHEN zk3 = zi THEN zs1 * zhlc[zi] ELSE 0e0 END
+                                   + CASE WHEN zk3 = zj AND zj <> zi
+                                          THEN zs2 * zhlc[zj] ELSE 0e0 END),
+                           zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
+                           ktrend, conc)).ll AS zfv
+                FROM (
+                    SELECT zh2.zc AS zcc, zh2.zwl AS zwlc, zh2.zxm AS zxmc,
+                           zh2.zdg AS zdgc,
+                           zh2.zhl AS zhlc, zh2.zf0 AS zf0c,
+                           zu1.zi, zu2.zj, (zsg.zst).zs1 AS zs1, (zsg.zst).zs2 AS zs2
+                    FROM unnest(range(1, zh2.znp + 1)) AS zu1(zi)
+                    CROSS JOIN unnest(range(1, zh2.znp + 1)) AS zu2(zj)
+                    CROSS JOIN LATERAL unnest(
+                        CASE WHEN zu2.zj = zu1.zi
+                             THEN [struct_pack(zs1 := 1e0, zs2 := 0e0),
+                                   struct_pack(zs1 := -1e0, zs2 := 0e0)]
+                             ELSE [struct_pack(zs1 := 1e0, zs2 := 1e0),
+                                   struct_pack(zs1 := 1e0, zs2 := -1e0),
+                                   struct_pack(zs1 := -1e0, zs2 := 1e0),
+                                   struct_pack(zs1 := -1e0, zs2 := -1e0)] END)
+                        AS zsg(zst)
+                    WHERE zu2.zj >= zu1.zi
+                )
+            )
+            GROUP BY zi, zj, zf0c, zhlc
+        )
+    ) zgr
+)
+SELECT (list_transform([_sarimax_inv_list(zng.znegh, zng.znp)], lambda zinv:
+           list_transform(range(1, zng.znp + 1), lambda zi6:
+               (list_transform([(zinv.x)[(zi6 - 1) * zng.znp + zi6]], lambda zdv:
+                    CASE WHEN (zinv.ok) AND zdv > 0e0 THEN sqrt(zdv) ELSE NULL END))[1])))[1] AS bse
+FROM (
+    SELECT znp,
+           list_transform(range(1, znp * znp + 1), lambda zidx:
+               -(ztri[(least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1) - 1)
+                      * (znp + 1)
+                      - least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1)
+                        * (least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1) - 1) // 2
+                      + (greatest((zidx - 1) // znp + 1, (zidx - 1) % znp + 1)
+                         - least((zidx - 1) // znp + 1, (zidx - 1) % znp + 1) + 1)])) AS znegh
+    FROM _sarimax_bs2_tri
+) zng;
+
+
 -- ================== sql/05_forecast.sql ==================
 
 -- ============================================================================
@@ -2841,6 +4688,11 @@ FROM (
 --       lower triangle of Omega: omega[j] = Omega[h, j] = Cov(w-forecast-
 --       errors at horizons h and j), j = 1..h. The full h x h block for any
 --       horizon follows by symmetry from rows 1..h. omega[h] == var_diff.
+--   _sarimax_fc_diff_v2(state_tbl, sys_tbl, dfut_tbl, hmax) AS TABLE
+--       -> same schema as _sarimax_fc_diff. The v2 variant: sys_tbl is the
+--       _sarimax_systems_v2 output (has cidx) and dfut_tbl carries an extra
+--       ct column (trend state intercept; see the macro header for the
+--       empirically-pinned timing). _sarimax_fc_diff itself is untouched.
 --   _sarimax_fc_orig(fcdiff_tbl, anchors_tbl, d, sd, s, hmax) AS TABLE
 --       -> (probe_id BIGINT, h BIGINT, mean_orig DOUBLE, var_orig DOUBLE)
 --       fcdiff_tbl: output of _sarimax_fc_diff (h dense 1..hmax per probe,
@@ -3225,6 +5077,151 @@ ORDER BY 1, 2;
 
 
 -- ----------------------------------------------------------------------------
+-- _sarimax_fc_diff_v2: the v2 horizon recursion -- identical omega/variance
+-- machinery to _sarimax_fc_diff (which stays untouched for the v1 tests), plus
+-- the trend STATE INTERCEPT of the v2 engine:
+--
+--   a_{h+1}[i] = (T a_h)[i] + (i = cidx ? ct_{h+1} : 0)
+--
+-- sys_tbl is the _sarimax_systems_v2 output (has cidx, the 1-based state row
+-- that receives the trend intercept, and kdiff); dfut_tbl is
+-- (probe_id, h, d, ct) with missing rows meaning d = 0 AND ct = 0.
+--
+-- CT TIMING CONVENTION (empirically pinned against the v2 trend fixtures'
+-- forecast.parquet; see sql/06_harness.sql where the rows are built):
+-- dfut.ct at row h is the state intercept CONSUMED FORMING the state used
+-- for mean_h. The alignment to model time depends on the filter basis
+-- (sql/03_filter.sql section 2, "the shifted-basis trick"):
+--   kdiff = 0  (unshifted): the h = 1 state is a_{n+1}, whose intercept
+--     c_{n_model} the filter already applied -- row 1's ct is never read,
+--     and advancing h -> h+1 adds row (h+1)'s ct = c_{n_model+h}. Callers
+--     fill ct[h] = c at model-time n_model + h - 1, i.e.
+--     _sarimax_trend_c(degs, tau, n_model, H)[h].
+--   kdiff > 0  (shifted basis): the stored filter state EXCLUDES its own
+--     pending intercept c_{n_model+1} (applied as 0 past the sample end), so
+--     THIS macro adds row 1's ct to the base state at cidx before the
+--     recursion; the state used for mean_h consumed c at model-time
+--     n_model + h. Callers fill ct[h] =
+--     _sarimax_trend_c(degs, tau, n_model + 1, H)[h].
+--
+-- P is unaffected by the intercept, so var_diff / omega are computed exactly
+-- as in v1. With ct identically 0 and cidx arbitrary this macro is
+-- row-for-row identical to _sarimax_fc_diff (test-enforced).
+-- ----------------------------------------------------------------------------
+CREATE OR REPLACE MACRO _sarimax_fc_diff_v2(state_tbl, sys_tbl, dfut_tbl, hmax) AS TABLE
+WITH RECURSIVE
+_sarimax_fcd2_chk AS (
+    SELECT CASE WHEN (hmax) < 1
+                THEN error('_sarimax_fc_diff_v2: H must be >= 1, got ' || (hmax))
+                ELSE true END AS ok
+),
+-- densified per-(probe, h) intercepts (both d and ct), same zero-base UNION
+-- trick as _sarimax_fc_diff (no outer join on a caller CTE)
+_sarimax_fcd2_df AS MATERIALIZED (
+    SELECT probe_id, h, sum(d) AS d, sum(ct) AS ct
+    FROM (
+        SELECT st.probe_id, zu.zh AS h, 0e0 AS d, 0e0 AS ct
+        FROM query_table(state_tbl) st
+        CROSS JOIN (SELECT unnest(range(1, (hmax)::BIGINT + 1)) AS zh) zu
+        UNION ALL
+        SELECT df.probe_id, df.h, df.d, df.ct
+        FROM query_table(dfut_tbl) df
+        WHERE df.h <= (hmax)
+    )
+    GROUP BY probe_id, h
+),
+_sarimax_fcd2 AS (
+    SELECT st.probe_id,
+           1::BIGINT AS h,
+           sy.k AS k,
+           sy.cidx AS cidx,
+           df.d + st.a[1] AS mean_diff,
+           st.p[1] AS var_diff,
+           [st.p[1]]::DOUBLE[] AS omega,
+           -- shifted basis (kdiff > 0): restore the pending intercept the
+           -- filter left out of the stored state (cidx > 1 there, so
+           -- mean_diff at h = 1 is unaffected)
+           list_transform(range(1, sy.k + 1), lambda zi:
+               st.a[zi] + CASE WHEN sy.kdiff > 0 AND zi = sy.cidx
+                               THEN df.ct ELSE 0e0 END) AS a,
+           st.p AS p,
+           list_transform(range(1, sy.k + 1), lambda zi:
+               CASE WHEN zi = 1 THEN 1e0 ELSE 0e0 END) AS gflat,
+           list_transform(range(1, sy.k + 1), lambda zi:
+               st.p[(zi - 1) * sy.k + 1]) AS pzflat
+    FROM query_table(state_tbl) st
+    JOIN query_table(sys_tbl) sy ON sy.probe_id = st.probe_id
+    JOIN _sarimax_fcd2_df df ON df.probe_id = st.probe_id AND df.h = 1
+    CROSS JOIN _sarimax_fcd2_chk ck
+    WHERE ck.ok
+    UNION ALL
+    SELECT probe_id,
+           h,
+           k,
+           cidx,
+           dnew + anew[1] AS mean_diff,
+           pnew[1] AS var_diff,
+           -- omega[zj] = Omega[h, zj] = dot(gvec_{h-zj}, column 1 of P_zj)
+           list_transform(range(1, h + 1), lambda zj:
+               list_reduce(
+                   list_transform(range(1, k + 1), lambda zi:
+                       gflat2[(h - zj) * k + zi] * pzflat2[(zj - 1) * k + zi]),
+                   lambda za, zb: za + zb)) AS omega,
+           anew AS a,
+           pnew AS p,
+           gflat2 AS gflat,
+           pzflat2 AS pzflat
+    FROM (
+        -- outer level: apply the state intercept to the propagated mean
+        -- (ta bound as a column below so the k^2 product is not re-expanded)
+        SELECT probe_id, h, k, cidx, dnew, pnew, gflat2, pzflat2,
+               list_transform(range(1, k + 1), lambda zi:
+                   ta[zi] + CASE WHEN zi = cidx THEN ctnew ELSE 0e0 END) AS anew
+        FROM (
+            -- middle level: extend the gvec / P-column accumulators
+            SELECT probe_id, h, k, cidx, dnew, ctnew, ta, pnew,
+                   gflat || gnew AS gflat2,
+                   pzflat || list_transform(range(1, k + 1), lambda zi:
+                       pnew[(zi - 1) * k + 1]) AS pzflat2
+            FROM (
+                -- inner level: one state-recursion step (intermediates bound
+                -- as columns so nothing re-expands inside downstream lambdas)
+                SELECT fc.probe_id,
+                       fc.h + 1 AS h,
+                       fc.k AS k,
+                       fc.cidx AS cidx,
+                       df.d AS dnew,
+                       df.ct AS ctnew,
+                       _sarimax_mmul(sy.tmat, fc.a, fc.k, fc.k, 1) AS ta,
+                       _sarimax_madd(
+                           _sarimax_mmul(
+                               _sarimax_mmul(sy.tmat, fc.p, fc.k, fc.k, fc.k),
+                               sy.tmat_t, fc.k, fc.k, fc.k),
+                           sy.rqr) AS pnew,
+                       -- gvec_h = gvec_{h-1} T (row vector times T, ascending fold)
+                       list_transform(range(1, fc.k + 1), lambda zj:
+                           list_reduce(
+                               list_transform(range(1, fc.k + 1), lambda zi:
+                                   fc.gflat[(fc.h - 1) * fc.k + zi]
+                                   * sy.tmat[(zi - 1) * fc.k + zj]),
+                               lambda za, zb: za + zb)) AS gnew,
+                       fc.gflat AS gflat,
+                       fc.pzflat AS pzflat
+                FROM _sarimax_fcd2 fc
+                JOIN query_table(sys_tbl) sy ON sy.probe_id = fc.probe_id
+                JOIN _sarimax_fcd2_df df
+                       ON df.probe_id = fc.probe_id AND df.h = fc.h + 1
+                WHERE fc.h < (hmax)
+            )
+        )
+    )
+)
+SELECT probe_id, h, mean_diff, var_diff, omega
+FROM _sarimax_fcd2
+ORDER BY 1, 2;
+
+
+-- ----------------------------------------------------------------------------
 -- _sarimax_forecast_run: the full chain on both scales. w_tbl (t, w) is the
 -- differenced IN-SAMPLE series t = 1..n_eff; exog_diff_full_tbl (t, j, x) the
 -- lockstep-differenced in-sample ++ future exog t = 1..n_eff+H (zero rows if
@@ -3269,7 +5266,9 @@ ORDER BY 1, 2;
 --
 -- Public macros (duckLM-style; table names as strings via query_table):
 --   sarimax_fit(data, y_col, p, d, q, sp := 0, sd := 0, sq := 0, s := 1,
---               exog_cols := []::VARCHAR[], t_col := NULL)          -> model table
+--               exog_cols := []::VARCHAR[], t_col := NULL,
+--               trend := 'n', concentrate := false,
+--               simple_differencing := true)             -> model table
 --   sarimax_forecast(model, data, y_col, h, newdata := NULL, t_col := NULL,
 --                    level := 0.95)                      -> forecasts
 --   sarimax_summary(model, data, y_col)                  -> coefficient table
@@ -3282,18 +5281,49 @@ ORDER BY 1, 2;
 -- collide. The seasonal orders are therefore sp, sd, sq (documented in
 -- GUIDE.md; positional order matches the spec).
 --
+-- V2 FIT OPTIONS (all fits route through the v2 engine of sql/02..04, which
+-- reproduces v1 arithmetic exactly at kdiff = 0, ktrend = 0, conc = false on
+-- a complete series):
+--   trend               'n' | 'c' | 't' | 'ct' -> polynomial degrees
+--                       [] | [0] | [1] | [0,1]; parameter names 'intercept'
+--                       (degree 0) and 'drift' (degree 1), ordered FIRST.
+--   concentrate         concentrate sigma2 out of the likelihood; sigma2 then
+--                       appears only in meta (engine scale2), not as a param.
+--   simple_differencing true  -> difference y/exog up front (v1 behavior;
+--                                trend timeline = DIFFERENCED timeline);
+--                       false -> filter the RAW series with the differencing
+--                                states inside the state vector (statsmodels
+--                                simple_differencing=False: no data loss,
+--                                burn-in of d + s*D, diffuse-ish init).
+--   Missing y (NULL) is allowed (not all-missing); exog must stay complete.
+--
+-- ROUTING NOTE: simple_differencing/concentrate/trend arrive as macro
+-- LITERALS, so the CASE/WHERE gates they feed constant-fold at plan time --
+-- the untaken branch of each UNION ALL pair is pruned and its error() checks
+-- never run.
+--
 -- Model table schema (kind VARCHAR, name VARCHAR, idx INT, value DOUBLE,
 -- value_list DOUBLE[]):
 --   'param'     one row per parameter, canonical order via idx, constrained
+--               (trend first, then exog betas, ar/ma/seasonal; sigma2 last
+--               UNLESS concentrate -- then no sigma2 param row at all)
 --   'param_unc' the same in unconstrained (optimizer) space
 --   'bse'       standard errors (numerical Hessian), aligned with 'param' idx
---   'spec'      p, d, q, sp, sd, sq, s, r, n, n_eff, k_states
---   'meta'      loglik, aic, bic, converged, iterations, grad_norm, restarted
+--   'spec'      p, d, q, sp, sd, sq, s, r, n, n_eff, sdiff, conc, ktrend, burn
+--   'meta'      loglik, aic, bic, converged, iterations, grad_norm, restarted,
+--               sigma2 (= engine scale2 when concentrated).
+--               AIC = 2k - 2ll, BIC = k*ln(n_eff - burn) - 2ll where k ALWAYS
+--               counts sigma2 (k = ktrend + r + p + q + sp + sq + 1, even when
+--               concentrated) and n_eff - burn = statsmodels' nobs_effective
+--               -- both pinned empirically against fixtures_v2 fitted_meta.
+--   'trend'     one row per trend term: idx, value = polynomial degree
 --   'anchor'    name 'endog:<stage>' idx/value rows (Layer 1 anchor contract),
---               and 'exog:<j>' trailing original-scale exog values
+--               and 'exog:<j>' trailing original-scale exog values;
+--               ONLY when sdiff = 1 (none stored when sdiff = 0)
 --   'exog_col'  idx j -> name of the j-th exogenous column
 --   'state'     name 'a' / 'P': final predicted state mean and vec(P) in
---               value_list; name 'k': state dimension in value
+--               value_list (UNIT scale when concentrated); name 'k': state
+--               dimension in value
 --
 -- Requires sql/00 .. sql/05.
 -- ============================================================================
@@ -3552,35 +5582,199 @@ SELECT zu.zt AS t, zl.j,
 FROM _sarimax_de_lists zl,
      LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
 
+-- ---- v2 helpers: trend arg, NULL-tolerant differencing ---------------------------
+
+-- trend argument -> polynomial degrees (0-based, statsmodels convention).
+-- PURE (no error() branch): this macro is textually expanded into engine
+-- arguments that may land inside a TRY(), where volatile error() is rejected
+-- by the binder. Validation lives in _sarimax_validate_trend, called from the
+-- fit's gate CTE (which every output row reads) BEFORE anything else runs.
+CREATE OR REPLACE MACRO _sarimax_trend_degrees(trend) AS (
+    CASE trend
+        WHEN 'c'  THEN [0]::BIGINT[]
+        WHEN 't'  THEN [1]::BIGINT[]
+        WHEN 'ct' THEN [0, 1]::BIGINT[]
+        ELSE []::BIGINT[]
+    END
+);
+
+CREATE OR REPLACE MACRO _sarimax_validate_trend(trend) AS (
+    CASE WHEN trend IN ('n', 'c', 't', 'ct') THEN true
+         ELSE error('sarimax: trend must be one of ''n'', ''c'', ''t'', ''ct''; got '
+                    || coalesce('''' || trend::VARCHAR || '''', 'NULL')) END
+);
+
+-- statsmodels' names for the trend parameters by degree.
+CREATE OR REPLACE MACRO _sarimax_trend_name(zdeg) AS (
+    CASE zdeg::BIGINT WHEN 0 THEN 'intercept' WHEN 1 THEN 'drift'
+         ELSE 'trend.' || zdeg::VARCHAR END
+);
+
+-- NULL-tolerant clone of Layer 1's _sarimax_stage_all: identical staged
+-- (sequential lag-subtract) differencing arithmetic -- bit-identical to
+-- np.diff / statsmodels simple_differencing=True on complete data -- but a
+-- NULL y propagates through the lag subtraction instead of raising (missing
+-- values are handled by the v2 filter). All other validation is kept.
+CREATE OR REPLACE MACRO _sarimax_stage_all_nt(tbl, tcol, ycol, d, sd, s) AS TABLE
+WITH
+_sarimax_snt_in AS MATERIALIZED (
+    SELECT struct_extract(_sarimax_r, tcol)::BIGINT AS t,
+           struct_extract(_sarimax_r, ycol)::DOUBLE AS a0
+    FROM (SELECT _sarimax_q AS _sarimax_r FROM query_table(tbl) AS _sarimax_q)
+),
+_sarimax_snt_chk AS (
+    SELECT CASE
+             WHEN d < 0 OR d > 4 THEN error('_sarimax_diff: d must be in 0..4, got ' || d)
+             WHEN sd < 0 OR sd > 3 THEN error('_sarimax_diff: D must be in 0..3, got ' || sd)
+             WHEN s < 1 THEN error('_sarimax_diff: s must be >= 1, got ' || s)
+             WHEN sd > 0 AND s < 2 THEN error('_sarimax_diff: s must be >= 2 when D > 0, got s = ' || s)
+             WHEN count(*) = 0 THEN error('_sarimax_diff: input series is empty')
+             WHEN min(t) != 1 OR max(t) != count(*) OR count(DISTINCT t) != count(*)
+               THEN error('_sarimax_diff: series time index must be dense 1..n (found min t = '
+                          || min(t) || ', max t = ' || max(t) || ', rows = ' || count(*) || ')')
+             WHEN count(*) < d + sd * s + 1
+               THEN error('_sarimax_diff: series too short: n = ' || count(*)
+                          || ' but d + D*s + 1 = ' || (d + sd * s + 1) || ' observations are required')
+             ELSE true
+           END AS ok
+    FROM _sarimax_snt_in
+),
+_sarimax_snt_a1 AS (
+    SELECT t, a0,
+           CASE WHEN d >= 1 THEN a0 - lag(a0) OVER (ORDER BY t) ELSE a0 END AS a1
+    FROM _sarimax_snt_in
+),
+_sarimax_snt_a2 AS (
+    SELECT t, a0, a1,
+           CASE WHEN d >= 2 THEN a1 - lag(a1) OVER (ORDER BY t) ELSE a1 END AS a2
+    FROM _sarimax_snt_a1
+),
+_sarimax_snt_a3 AS (
+    SELECT t, a0, a1, a2,
+           CASE WHEN d >= 3 THEN a2 - lag(a2) OVER (ORDER BY t) ELSE a2 END AS a3
+    FROM _sarimax_snt_a2
+),
+_sarimax_snt_a4 AS (
+    SELECT t, a0, a1, a2, a3,
+           CASE WHEN d >= 4 THEN a3 - lag(a3) OVER (ORDER BY t) ELSE a3 END AS a4
+    FROM _sarimax_snt_a3
+),
+_sarimax_snt_b1 AS (
+    SELECT t, a0, a1, a2, a3, a4,
+           CASE WHEN sd >= 1 THEN a4 - lag(a4, s) OVER (ORDER BY t) ELSE a4 END AS b1
+    FROM _sarimax_snt_a4
+),
+_sarimax_snt_b2 AS (
+    SELECT t, a0, a1, a2, a3, a4, b1,
+           CASE WHEN sd >= 2 THEN b1 - lag(b1, s) OVER (ORDER BY t) ELSE b1 END AS b2
+    FROM _sarimax_snt_b1
+),
+_sarimax_snt_b3 AS (
+    SELECT t, a0, a1, a2, a3, a4, b1, b2,
+           CASE WHEN sd >= 3 THEN b2 - lag(b2, s) OVER (ORDER BY t) ELSE b2 END AS b3
+    FROM _sarimax_snt_b2
+)
+SELECT f.t, f.a0, f.a1, f.a2, f.a3, f.a4, f.a4 AS b0, f.b1, f.b2, f.b3
+FROM _sarimax_snt_b3 f, _sarimax_snt_chk c
+WHERE c.ok;
+
+-- NULL-tolerant _sarimax_diff (rows where a lag reaches a NULL carry NULL w).
+CREATE OR REPLACE MACRO _sarimax_diff_nt(tbl, tcol, ycol, d, sd, s) AS TABLE
+SELECT (st.t - (d + sd * s))::BIGINT AS t, st.b3 AS w
+FROM _sarimax_stage_all_nt(tbl, tcol, ycol, d, sd, s) st
+WHERE st.t > d + sd * s
+ORDER BY 1;
+
+-- NULL-tolerant _sarimax_diff_anchors. A NULL trailing value produces a NULL
+-- anchor row, which _sarimax_fc_orig rejects loudly at FORECAST time (fitting
+-- a model whose trailing observations are missing is fine; integrating a
+-- forecast from a missing anchor is not).
+CREATE OR REPLACE MACRO _sarimax_diff_anchors_nt(tbl, tcol, ycol, d, sd, s) AS TABLE
+WITH
+_sarimax_dnt_st AS MATERIALIZED (
+    SELECT * FROM _sarimax_stage_all_nt(tbl, tcol, ycol, d, sd, s)
+),
+_sarimax_dnt_n AS (
+    SELECT max(t) AS n FROM _sarimax_dnt_st
+)
+SELECT stage, idx, value
+FROM (
+    SELECT g.i::INT AS stage, 1::INT AS idx,
+           CASE g.i WHEN 1 THEN st.a0 WHEN 2 THEN st.a1 WHEN 3 THEN st.a2 WHEN 4 THEN st.a3 END AS value
+    FROM _sarimax_dnt_st st, _sarimax_dnt_n nn, range(1, d + 1) g(i)
+    WHERE st.t = nn.n
+    UNION ALL
+    SELECT (d + g.k)::INT AS stage, (st.t - (nn.n - s))::INT AS idx,
+           CASE g.k WHEN 1 THEN st.b0 WHEN 2 THEN st.b1 WHEN 3 THEN st.b2 END AS value
+    FROM _sarimax_dnt_st st, _sarimax_dnt_n nn, range(1, sd + 1) g(k)
+    WHERE st.t > nn.n - s
+)
+ORDER BY stage, idx;
+
 -- ---- the fit --------------------------------------------------------------------
 
 CREATE OR REPLACE MACRO sarimax_fit(data, y_col, p, d, q,
                                     sp := 0, sd := 0, sq := 0, s := 1,
-                                    exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
-WITH _sarimax_f_chk AS (
-    SELECT _sarimax_validate_spec(p, d, q, sp, sd, sq, s) AS ok
-),
-_sarimax_f_series AS (
+                                    exog_cols := []::VARCHAR[], t_col := NULL,
+                                    trend := 'n', concentrate := false,
+                                    simple_differencing := true) AS TABLE
+WITH _sarimax_f_series AS (
     SELECT t, y FROM _sarimax_series_of(data, y_col, t_col)
+),
+_sarimax_f_chk AS (
+    SELECT _sarimax_validate_spec(p, d, q, sp, sd, sq, s)
+           AND _sarimax_validate_trend(trend)
+           AND (SELECT CASE
+                         WHEN count(*) = 0 THEN error('sarimax: input series is empty')
+                         WHEN count(y) = 0
+                           THEN error('sarimax: series is all-missing (every y is NULL)')
+                         ELSE true END
+                FROM _sarimax_f_series) AS ok
 ),
 _sarimax_f_exog AS (
     SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
-_sarimax_f_w AS (
-    SELECT t, w FROM _sarimax_diff('_sarimax_f_series', 't', 'y', d, sd, s)
+-- model-scale series: differenced up front when simple_differencing (the
+-- NULL-tolerant staged variant: bit-identical to v1 on complete data, NULL y
+-- propagates), the RAW series otherwise. Literal WHERE gates constant-fold.
+_sarimax_f_y AS (
+    SELECT t, w AS y FROM _sarimax_diff_nt('_sarimax_f_series', 't', 'y', d, sd, s)
+    WHERE simple_differencing
+    UNION ALL
+    SELECT t, y FROM _sarimax_f_series
+    WHERE NOT simple_differencing
 ),
 _sarimax_f_exd AS (
     SELECT t, j, x FROM _sarimax_diff_exog('_sarimax_f_exog', d, sd, s)
+    WHERE simple_differencing
+    UNION ALL
+    SELECT t, j, x FROM _sarimax_f_exog
+    WHERE NOT simple_differencing
+),
+_sarimax_f_degs AS (
+    SELECT unnest(range(1, len(_sarimax_trend_degrees(trend)) + 1))::BIGINT AS idx,
+           unnest(_sarimax_trend_degrees(trend))::BIGINT AS degree
 ),
 _sarimax_f_fit AS (
-    SELECT * FROM _sarimax_bfgs('_sarimax_f_w', '_sarimax_f_exd',
-                                len(exog_cols), p, q, sp, sq, greatest(s, 1))
+    SELECT * FROM _sarimax_bfgs_v2('_sarimax_f_y', '_sarimax_f_exd', '_sarimax_f_degs',
+                                   len(exog_cols), p, q, sp, sq, greatest(s, 1),
+                                   CASE WHEN simple_differencing THEN 0 ELSE d END,
+                                   CASE WHEN simple_differencing THEN 0 ELSE sd END,
+                                   len(_sarimax_trend_degrees(trend)), concentrate)
 ),
 _sarimax_f_dims AS (
     SELECT len(exog_cols)::INT AS r,
+           len(_sarimax_trend_degrees(trend))::INT AS ktrend,
            (SELECT count(*) FROM _sarimax_f_series)::INT AS n,
-           (SELECT count(*) FROM _sarimax_f_w)::INT AS n_eff,
-           (len(exog_cols) + p + q + sp + sq + 1)::INT AS k_params
+           (SELECT count(*) FROM _sarimax_f_y)::INT AS n_eff,
+           (CASE WHEN simple_differencing THEN 0 ELSE d + greatest(s, 1) * sd END)::INT AS burn,
+           -- reported parameter count (sigma2 dropped when concentrated) ...
+           (len(_sarimax_trend_degrees(trend)) + len(exog_cols) + p + q + sp + sq
+            + CASE WHEN concentrate THEN 0 ELSE 1 END)::INT AS k_params,
+           -- ... but AIC/BIC ALWAYS count sigma2 (statsmodels' df_model does,
+           -- concentrated or not; pinned against fixtures_v2 fitted_meta)
+           (len(_sarimax_trend_degrees(trend)) + len(exog_cols) + p + q + sp + sq + 1)::INT
+               AS k_aicbic
     FROM _sarimax_f_chk
     WHERE ok
 ),
@@ -3588,38 +5782,55 @@ _sarimax_f_probe AS (
     SELECT 1::BIGINT AS probe_id, params FROM _sarimax_f_fit
 ),
 _sarimax_f_sys AS (
-    SELECT * FROM _sarimax_systems('_sarimax_f_probe', len(exog_cols), p, q, sp, sq, greatest(s, 1))
+    SELECT * FROM _sarimax_systems_v2('_sarimax_f_probe', len(exog_cols), p, q, sp, sq,
+                                      greatest(s, 1),
+                                      CASE WHEN simple_differencing THEN 0 ELSE d END,
+                                      CASE WHEN simple_differencing THEN 0 ELSE sd END,
+                                      len(_sarimax_trend_degrees(trend)), concentrate)
 ),
 _sarimax_f_obs AS (
-    SELECT * FROM _sarimax_obs_adj('_sarimax_f_w', '_sarimax_f_exd', '_sarimax_f_probe')
+    SELECT * FROM _sarimax_obs_adj_v2('_sarimax_f_y', '_sarimax_f_exd', '_sarimax_f_probe',
+                                      len(exog_cols), len(_sarimax_trend_degrees(trend)),
+                                      '_sarimax_f_degs')
 ),
 _sarimax_f_state AS (
-    SELECT * FROM _sarimax_kfilter_state('_sarimax_f_obs', '_sarimax_f_sys')
+    SELECT * FROM _sarimax_kfilter_state_v2('_sarimax_f_obs', '_sarimax_f_sys')
 ),
 _sarimax_f_lists AS (
-    SELECT (SELECT list(w ORDER BY t) FROM _sarimax_f_w) AS wlist,
+    SELECT (SELECT list(y ORDER BY t) FROM _sarimax_f_y) AS ylist,
            (SELECT CASE WHEN len(exog_cols) = 0
-                        THEN (SELECT list([]::DOUBLE[]) FROM _sarimax_f_w)
+                        THEN (SELECT list([]::DOUBLE[]) FROM _sarimax_f_y)
                         ELSE (SELECT list(zxr ORDER BY zt)
                               FROM (SELECT t AS zt, list(x ORDER BY j) AS zxr
                                     FROM _sarimax_f_exd GROUP BY t))
-                   END) AS xmat
+                   END) AS xmat,
+           (SELECT coalesce(list(degree ORDER BY idx), []::BIGINT[])
+            FROM _sarimax_f_degs) AS degs
 ),
 _sarimax_f_bse AS (
-    SELECT bse FROM _sarimax_bse(
+    SELECT bse FROM _sarimax_bse_v2(
         (SELECT params FROM _sarimax_f_fit),
-        (SELECT wlist FROM _sarimax_f_lists),
+        (SELECT ylist FROM _sarimax_f_lists),
         (SELECT xmat FROM _sarimax_f_lists),
-        len(exog_cols), p, q, sp, sq, greatest(s, 1))
+        (SELECT degs FROM _sarimax_f_lists),
+        len(exog_cols), p, q, sp, sq, greatest(s, 1),
+        CASE WHEN simple_differencing THEN 0 ELSE d END,
+        CASE WHEN simple_differencing THEN 0 ELSE sd END,
+        len(_sarimax_trend_degrees(trend)), concentrate)
 ),
 _sarimax_f_names AS (
     SELECT list_transform(range(1, dm.k_params + 1), lambda zi:
         CASE
-        WHEN zi <= dm.r THEN exog_cols[zi]
-        WHEN zi <= dm.r + p THEN 'ar.L' || (zi - dm.r)::VARCHAR
-        WHEN zi <= dm.r + p + q THEN 'ma.L' || (zi - dm.r - p)::VARCHAR
-        WHEN zi <= dm.r + p + q + sp THEN 'ar.S.L' || ((zi - dm.r - p - q) * s)::VARCHAR
-        WHEN zi <= dm.r + p + q + sp + sq THEN 'ma.S.L' || ((zi - dm.r - p - q - sp) * s)::VARCHAR
+        WHEN zi <= dm.ktrend
+            THEN _sarimax_trend_name((_sarimax_trend_degrees(trend))[zi])
+        WHEN zi <= dm.ktrend + dm.r THEN exog_cols[zi - dm.ktrend]
+        WHEN zi <= dm.ktrend + dm.r + p THEN 'ar.L' || (zi - dm.ktrend - dm.r)::VARCHAR
+        WHEN zi <= dm.ktrend + dm.r + p + q
+            THEN 'ma.L' || (zi - dm.ktrend - dm.r - p)::VARCHAR
+        WHEN zi <= dm.ktrend + dm.r + p + q + sp
+            THEN 'ar.S.L' || ((zi - dm.ktrend - dm.r - p - q) * s)::VARCHAR
+        WHEN zi <= dm.ktrend + dm.r + p + q + sp + sq
+            THEN 'ma.S.L' || ((zi - dm.ktrend - dm.r - p - q - sp) * s)::VARCHAR
         ELSE 'sigma2' END) AS pnames
     FROM _sarimax_f_dims dm
 )
@@ -3638,11 +5849,15 @@ FROM _sarimax_f_bse bs, _sarimax_f_names nm, _sarimax_f_dims dm,
 UNION ALL
 SELECT 'spec', zsp.name, zsp.i::INT, zsp.v, NULL
 FROM _sarimax_f_dims dm,
-     LATERAL (SELECT unnest(['p','d','q','sp','sd','sq','s','r','n','n_eff']) AS name,
-                     unnest(range(1, 11)) AS i,
+     LATERAL (SELECT unnest(['p','d','q','sp','sd','sq','s','r','n','n_eff',
+                             'sdiff','conc','ktrend','burn']) AS name,
+                     unnest(range(1, 15)) AS i,
                      unnest([p::DOUBLE, d::DOUBLE, q::DOUBLE, sp::DOUBLE, sd::DOUBLE,
                              sq::DOUBLE, s::DOUBLE, dm.r::DOUBLE, dm.n::DOUBLE,
-                             dm.n_eff::DOUBLE]) AS v) zsp
+                             dm.n_eff::DOUBLE,
+                             CASE WHEN simple_differencing THEN 1e0 ELSE 0e0 END,
+                             CASE WHEN concentrate THEN 1e0 ELSE 0e0 END,
+                             dm.ktrend::DOUBLE, dm.burn::DOUBLE]) AS v) zsp
 UNION ALL
 SELECT 'meta', zm.name, zm.i::INT, zm.v, NULL
 FROM _sarimax_f_fit ft, _sarimax_f_dims dm,
@@ -3650,16 +5865,21 @@ FROM _sarimax_f_fit ft, _sarimax_f_dims dm,
                              'grad_norm','restarted','sigma2']) AS name,
                      unnest(range(1, 9)) AS i,
                      unnest([ft.loglik,
-                             2e0 * dm.k_params - 2e0 * ft.loglik,
-                             dm.k_params * ln(dm.n_eff::DOUBLE) - 2e0 * ft.loglik,
+                             2e0 * dm.k_aicbic - 2e0 * ft.loglik,
+                             dm.k_aicbic * ln((dm.n_eff - dm.burn)::DOUBLE) - 2e0 * ft.loglik,
                              CASE WHEN ft.converged THEN 1e0 ELSE 0e0 END,
                              ft.iterations::DOUBLE,
                              ft.grad_norm,
                              CASE WHEN ft.restarted THEN 1e0 ELSE 0e0 END,
-                             ft.params[dm.k_params]]) AS v) zm
+                             CASE WHEN concentrate THEN ft.scale2
+                                  ELSE ft.params[dm.k_params] END]) AS v) zm
+UNION ALL
+SELECT 'trend', _sarimax_trend_name(dg.degree), dg.idx::INT, dg.degree::DOUBLE, NULL
+FROM _sarimax_f_degs dg
 UNION ALL
 SELECT 'anchor', 'endog:' || za.stage::VARCHAR, za.idx::INT, za.value, NULL
-FROM _sarimax_diff_anchors('_sarimax_f_series', 't', 'y', d, sd, s) za
+FROM _sarimax_diff_anchors_nt('_sarimax_f_series', 't', 'y', d, sd, s) za
+WHERE simple_differencing
 UNION ALL
 SELECT 'anchor', 'exog:' || ze.j::VARCHAR, ze.ai::INT, ze.x, NULL
 FROM (
@@ -3672,6 +5892,7 @@ FROM (
     )
     WHERE rdesc <= d + sd * s
 ) ze
+WHERE simple_differencing
 UNION ALL
 SELECT 'exog_col', exog_cols[zu.zi], zu.zi::INT, NULL, NULL
 FROM _sarimax_f_dims dm, LATERAL unnest(range(1, dm.r + 1)) AS zu(zi)
@@ -3726,10 +5947,38 @@ CREATE OR REPLACE MACRO _sarimax_check_exog_names(model, exog_cols) AS (
                         FROM query_table(model) WHERE kind = 'exog_col')) END
 );
 
--- Recompute the innovation trace at theta-hat from the data + model table.
+-- Recompute the innovation trace at theta-hat from the data + model table,
+-- through the V2 engine (so trend / concentrated / missing-value / nodiff
+-- models diagnose correctly; a v1-style model is the kdiff = ktrend = 0,
+-- conc = 0 special case). v is NULL (hence std_resid NULL) at missing t;
+-- F is still reported there. When the model is concentrated the reported F
+-- (and hence std_resid) is rescaled by meta sigma2 -- statsmodels' reported
+-- trace has F multiplied by the scale, the stored state runs at unit scale.
 CREATE OR REPLACE MACRO _sarimax_retrace(model, data, y_col, exog_cols, t_col) AS TABLE
 WITH _sarimax_rt_chk AS (
     SELECT _sarimax_check_exog_names(model, exog_cols) AS ok
+),
+-- spec values bound as columns once; effective INTEGRATION orders (d_eff,
+-- sd_eff: applied to the data up front, zero when sdiff = 0) vs ENGINE orders
+-- (d_eng, sd_eng: differencing states inside the filter, zero when sdiff = 1).
+-- coalesce defaults keep model tables from before the v2 columns readable.
+_sarimax_rt_dims AS (
+    SELECT zz.*,
+           CASE WHEN zz.sdiff = 1 THEN zz.d  ELSE 0 END AS d_eff,
+           CASE WHEN zz.sdiff = 1 THEN zz.sd ELSE 0 END AS sd_eff,
+           CASE WHEN zz.sdiff = 1 THEN 0 ELSE zz.d  END AS d_eng,
+           CASE WHEN zz.sdiff = 1 THEN 0 ELSE zz.sd END AS sd_eng
+    FROM (SELECT _sarimax_m_spec(model, 'r')::INT AS r,
+                 _sarimax_m_spec(model, 'p')::INT AS p,
+                 _sarimax_m_spec(model, 'q')::INT AS q,
+                 _sarimax_m_spec(model, 'sp')::INT AS sp,
+                 _sarimax_m_spec(model, 'sq')::INT AS sq,
+                 greatest(_sarimax_m_spec(model, 's')::INT, 1) AS s,
+                 _sarimax_m_spec(model, 'd')::INT AS d,
+                 _sarimax_m_spec(model, 'sd')::INT AS sd,
+                 coalesce(_sarimax_m_spec(model, 'sdiff'), 1e0)::INT AS sdiff,
+                 coalesce(_sarimax_m_spec(model, 'conc'), 0e0)::INT AS conc,
+                 coalesce(_sarimax_m_spec(model, 'ktrend'), 0e0)::INT AS ktrend) zz
 ),
 _sarimax_rt_series AS (
     SELECT zs.t, zs.y FROM _sarimax_series_of(data, y_col, t_col) zs, _sarimax_rt_chk zc
@@ -3738,35 +5987,53 @@ _sarimax_rt_series AS (
 _sarimax_rt_exog AS (
     SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
-_sarimax_rt_w AS (
-    SELECT t, w FROM _sarimax_diff_dyn('_sarimax_rt_series', 't', 'y',
-        _sarimax_m_spec(model, 'd'),
-        _sarimax_m_spec(model, 'sd'),
-        _sarimax_m_spec(model, 's'))
+-- _sarimax_diff_dyn with d = D = 0 is an exact identity (0e0 + 1e0 * y) and
+-- propagates NULL y, so ONE call serves both sdiff modes.
+_sarimax_rt_y AS (
+    SELECT t, w AS y FROM _sarimax_diff_dyn('_sarimax_rt_series', 't', 'y',
+        (SELECT d_eff FROM _sarimax_rt_dims),
+        (SELECT sd_eff FROM _sarimax_rt_dims),
+        (SELECT s FROM _sarimax_rt_dims))
 ),
 _sarimax_rt_exd AS (
     SELECT t, j, x FROM _sarimax_diff_exog_dyn('_sarimax_rt_exog',
-        _sarimax_m_spec(model, 'd'),
-        _sarimax_m_spec(model, 'sd'),
-        _sarimax_m_spec(model, 's'))
+        (SELECT d_eff FROM _sarimax_rt_dims),
+        (SELECT sd_eff FROM _sarimax_rt_dims),
+        (SELECT s FROM _sarimax_rt_dims))
 ),
 _sarimax_rt_probe AS (
     SELECT 1::BIGINT AS probe_id, _sarimax_m_params(model) AS params
 ),
+_sarimax_rt_degs AS (
+    SELECT idx::BIGINT AS idx, value::BIGINT AS degree
+    FROM query_table(model) WHERE kind = 'trend'
+),
 _sarimax_rt_sys AS (
-    SELECT * FROM _sarimax_systems('_sarimax_rt_probe',
-        _sarimax_m_spec(model, 'r')::INT,
-        _sarimax_m_spec(model, 'p')::INT,
-        _sarimax_m_spec(model, 'q')::INT,
-        _sarimax_m_spec(model, 'sp')::INT,
-        _sarimax_m_spec(model, 'sq')::INT,
-        greatest(_sarimax_m_spec(model, 's')::INT, 1))
+    SELECT * FROM _sarimax_systems_v2('_sarimax_rt_probe',
+        (SELECT r FROM _sarimax_rt_dims),
+        (SELECT p FROM _sarimax_rt_dims),
+        (SELECT q FROM _sarimax_rt_dims),
+        (SELECT sp FROM _sarimax_rt_dims),
+        (SELECT sq FROM _sarimax_rt_dims),
+        (SELECT s FROM _sarimax_rt_dims),
+        (SELECT d_eng FROM _sarimax_rt_dims),
+        (SELECT sd_eng FROM _sarimax_rt_dims),
+        (SELECT ktrend FROM _sarimax_rt_dims),
+        (SELECT conc = 1 FROM _sarimax_rt_dims))
 ),
 _sarimax_rt_obs AS (
-    SELECT * FROM _sarimax_obs_adj('_sarimax_rt_w', '_sarimax_rt_exd', '_sarimax_rt_probe')
+    SELECT * FROM _sarimax_obs_adj_v2('_sarimax_rt_y', '_sarimax_rt_exd', '_sarimax_rt_probe',
+        (SELECT r FROM _sarimax_rt_dims),
+        (SELECT ktrend FROM _sarimax_rt_dims),
+        '_sarimax_rt_degs')
+),
+_sarimax_rt_scale AS (
+    SELECT CASE WHEN zd.conc = 1 THEN _sarimax_m_meta(model, 'sigma2') ELSE 1e0 END AS sc
+    FROM _sarimax_rt_dims zd
 )
-SELECT t, v, f, v / sqrt(f) AS std_resid
-FROM _sarimax_kfilter('_sarimax_rt_obs', '_sarimax_rt_sys');
+SELECT zk.t, zk.v, zk.f * zs.sc AS f, zk.v / sqrt(zk.f * zs.sc) AS std_resid
+FROM _sarimax_kfilter_v2('_sarimax_rt_obs', '_sarimax_rt_sys') zk
+CROSS JOIN _sarimax_rt_scale zs;
 
 CREATE OR REPLACE MACRO sarimax_residuals(model, data, y_col, exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 SELECT t, v, f, std_resid
@@ -3774,9 +6041,15 @@ FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)
 ORDER BY t;
 
 -- Ljung-Box Q on the standardized innovations at the exact lag set 1..nlags.
+-- Computed on the NON-NULL std_resid only (missing-y timesteps produce NULL
+-- innovations): the surviving residuals are compacted in time order and n is
+-- their count -- drop-the-NaNs, the same thing one does before handing a
+-- residual series with gaps to statsmodels' acorr_ljungbox.
 CREATE OR REPLACE MACRO sarimax_ljungbox(model, data, y_col, nlags, exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 WITH _sarimax_lb_sr AS (
-    SELECT t, std_resid FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)
+    SELECT row_number() OVER (ORDER BY t) AS t, std_resid
+    FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)
+    WHERE std_resid IS NOT NULL
 ),
 _sarimax_lb_acf AS (
     SELECT lag, acf FROM _sarimax_acf('_sarimax_lb_sr', 't', 'std_resid', nlags)
@@ -3797,18 +6070,35 @@ SELECT lag, stat, _sarimax_chi2_sf(stat, lag::DOUBLE) AS pvalue
 FROM _sarimax_lb_q
 ORDER BY lag;
 
+-- sigma2 reported from meta (= the engine's concentrated scale2 when the
+-- model was fit with concentrate := true). resid_finite_frac is computed over
+-- the NON-NULL std_resid (missing-y timesteps are excluded, not penalized).
 CREATE OR REPLACE MACRO sarimax_evaluate(model, data, y_col, exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 SELECT _sarimax_m_meta(model, 'loglik') AS loglik,
        _sarimax_m_meta(model, 'aic') AS aic,
        _sarimax_m_meta(model, 'bic') AS bic,
        _sarimax_m_meta(model, 'sigma2') AS sigma2,
        _sarimax_m_spec(model, 'n_eff') AS n_eff,
-       (SELECT 1e0 - (count(*) FILTER (WHERE NOT isfinite(std_resid)))::DOUBLE / count(*)
+       (SELECT 1e0 - (count(*) FILTER (WHERE NOT isfinite(std_resid)))::DOUBLE
+                     / count(std_resid)
         FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)) AS resid_finite_frac,
        _sarimax_m_meta(model, 'converged') AS converged;
 
 -- ---- forecast -----------------------------------------------------------------------
 
+-- ONE pipeline serves both fit modes:
+--   sdiff = 1: the v1 path -- future exog = trailing anchors ++ newdata,
+--     lockstep-differenced; the diff-scale recursion runs the (d = D = 0)
+--     v2 system; _sarimax_fc_orig integrates with the model's d, D.
+--   sdiff = 0: the model scale IS the original scale -- the integration
+--     orders (d_eff, sd_eff) collapse to 0, making _sarimax_fc_orig an exact
+--     identity (weights c[h,l] = delta, anchor checks vacuous, no anchors
+--     stored or needed) and future exog enter RAW (identity differencing).
+-- Trend models add the state intercept inside _sarimax_fc_diff_v2 (ct
+-- timing pinned there; the trend_c window starts at n_eff when the engine
+-- ran unshifted, n_eff + 1 in the shifted kdiff > 0 basis). Concentrated
+-- models: the stored state P is at unit scale, so both variance columns are
+-- multiplied by meta sigma2 before se / lo / hi.
 CREATE OR REPLACE MACRO sarimax_forecast(model, data, y_col, h,
                                          newdata := NULL, exog_cols := []::VARCHAR[],
                                          t_col := NULL, level := 0.95) AS TABLE
@@ -3819,29 +6109,41 @@ WITH _sarimax_fc_chk AS (
                     ELSE true END AS ok
 ),
 _sarimax_fc_dims AS (
-    SELECT _sarimax_m_spec(model, 'r')::INT AS r,
-           _sarimax_m_spec(model, 'p')::INT AS p,
-           _sarimax_m_spec(model, 'q')::INT AS q,
-           _sarimax_m_spec(model, 'sp')::INT AS sp,
-           _sarimax_m_spec(model, 'sd')::INT AS sd,
-           _sarimax_m_spec(model, 'sq')::INT AS sq,
-           _sarimax_m_spec(model, 's')::INT AS s,
-           _sarimax_m_spec(model, 'd')::INT AS d,
-           _sarimax_m_spec(model, 'n_eff')::BIGINT AS n_eff
-    FROM _sarimax_fc_chk
-    WHERE ok
+    SELECT zz.*,
+           CASE WHEN zz.sdiff = 1 THEN zz.d  ELSE 0 END AS d_eff,
+           CASE WHEN zz.sdiff = 1 THEN zz.sd ELSE 0 END AS sd_eff,
+           CASE WHEN zz.sdiff = 1 THEN 0 ELSE zz.d  END AS d_eng,
+           CASE WHEN zz.sdiff = 1 THEN 0 ELSE zz.sd END AS sd_eng
+    FROM (SELECT _sarimax_m_spec(model, 'r')::INT AS r,
+                 _sarimax_m_spec(model, 'p')::INT AS p,
+                 _sarimax_m_spec(model, 'q')::INT AS q,
+                 _sarimax_m_spec(model, 'sp')::INT AS sp,
+                 _sarimax_m_spec(model, 'sd')::INT AS sd,
+                 _sarimax_m_spec(model, 'sq')::INT AS sq,
+                 _sarimax_m_spec(model, 's')::INT AS s,
+                 _sarimax_m_spec(model, 'd')::INT AS d,
+                 _sarimax_m_spec(model, 'n_eff')::BIGINT AS n_eff,
+                 coalesce(_sarimax_m_spec(model, 'sdiff'), 1e0)::INT AS sdiff,
+                 coalesce(_sarimax_m_spec(model, 'conc'), 0e0)::INT AS conc,
+                 coalesce(_sarimax_m_spec(model, 'ktrend'), 0e0)::INT AS ktrend
+          FROM _sarimax_fc_chk
+          WHERE ok) zz
 ),
 _sarimax_fc_probe AS MATERIALIZED (
     SELECT 1::BIGINT AS probe_id, _sarimax_m_params(model) AS params
 ),
 _sarimax_fc_sys AS MATERIALIZED (
-    SELECT * FROM _sarimax_systems('_sarimax_fc_probe',
-        _sarimax_m_spec(model, 'r')::INT,
-        _sarimax_m_spec(model, 'p')::INT,
-        _sarimax_m_spec(model, 'q')::INT,
-        _sarimax_m_spec(model, 'sp')::INT,
-        _sarimax_m_spec(model, 'sq')::INT,
-        greatest(_sarimax_m_spec(model, 's')::INT, 1))
+    SELECT * FROM _sarimax_systems_v2('_sarimax_fc_probe',
+        (SELECT r FROM _sarimax_fc_dims),
+        (SELECT p FROM _sarimax_fc_dims),
+        (SELECT q FROM _sarimax_fc_dims),
+        (SELECT sp FROM _sarimax_fc_dims),
+        (SELECT sq FROM _sarimax_fc_dims),
+        (SELECT greatest(s, 1) FROM _sarimax_fc_dims),
+        (SELECT d_eng FROM _sarimax_fc_dims),
+        (SELECT sd_eng FROM _sarimax_fc_dims),
+        (SELECT ktrend FROM _sarimax_fc_dims),
+        (SELECT conc = 1 FROM _sarimax_fc_dims))
 ),
 _sarimax_fc_state AS MATERIALIZED (
     SELECT 1::BIGINT AS probe_id,
@@ -3850,15 +6152,17 @@ _sarimax_fc_state AS MATERIALIZED (
            (SELECT value_list FROM query_table(model) WHERE kind = 'state' AND name = 'P') AS p,
            _sarimax_m_meta(model, 'loglik') AS loglik
 ),
--- future exog: trailing in-sample anchors ++ newdata, differenced; rows re-densify
--- to exactly h future differenced rows
+-- future exog: trailing in-sample anchors ++ newdata on a shifted axis (the
+-- shift = d_eff + sd_eff*s = 0 with no anchor rows when sdiff = 0, so the
+-- newdata rows pass through raw), differenced by the EFFECTIVE orders; rows
+-- re-densify to exactly h future rows on the model scale
 _sarimax_fc_exfull AS (
     SELECT za.j, za.ai AS tt, za.value AS x, 0 AS grp
     FROM (SELECT split_part(name, ':', 2)::INT AS j, idx AS ai, value
           FROM query_table(model) WHERE kind = 'anchor' AND name LIKE 'exog:%') za
     UNION ALL
     SELECT zx.j,
-           (SELECT max(zd2.d + zd2.sd * zd2.s) FROM _sarimax_fc_dims zd2) + zx.t,
+           (SELECT max(zd2.d_eff + zd2.sd_eff * zd2.s) FROM _sarimax_fc_dims zd2) + zx.t,
            zx.x, 1
     FROM _sarimax_exog_of(coalesce(newdata, data), exog_cols, y_col, t_col) zx
 ),
@@ -3868,20 +6172,56 @@ _sarimax_fc_exfull2 AS (
 _sarimax_fc_exd AS MATERIALIZED (
     SELECT zz.t, zz.j, zz.x
     FROM _sarimax_diff_exog_dyn('_sarimax_fc_exfull2',
-        (SELECT d FROM _sarimax_fc_dims),
-        (SELECT sd FROM _sarimax_fc_dims),
+        (SELECT d_eff FROM _sarimax_fc_dims),
+        (SELECT sd_eff FROM _sarimax_fc_dims),
         (SELECT s FROM _sarimax_fc_dims)) zz
 ),
+-- trend state intercepts for the horizon window, bound as columns FIRST (the
+-- degs/tau expressions must not reach _sarimax_trend_c's lambdas as raw
+-- subqueries). ct[zh] = the intercept consumed FORMING the state used at
+-- horizon zh: c at model-time n_eff + zh - 1 in the unshifted (kdiff = 0)
+-- filter basis, n_eff + zh in the shifted one (kdiff = d_eng + s*sd_eng > 0,
+-- where the stored state excludes its pending intercept) -- see
+-- _sarimax_fc_diff_v2's header.
+_sarimax_fc_targs AS (
+    SELECT zd.ktrend AS ktrend,
+           (SELECT coalesce(list(value::BIGINT ORDER BY idx), []::BIGINT[])
+            FROM query_table(model) WHERE kind = 'trend') AS degs,
+           list_slice(zp.params, 1, zd.ktrend) AS tau,
+           zd.n_eff + CASE WHEN zd.d_eng + zd.s * zd.sd_eng > 0
+                           THEN 1 ELSE 0 END AS tstart
+    FROM _sarimax_fc_dims zd, _sarimax_fc_probe zp
+),
+_sarimax_fc_ct AS (
+    SELECT CASE WHEN ta.ktrend = 0
+                THEN list_transform(range(1, (h)::BIGINT + 1), lambda zi: 0e0)
+                ELSE _sarimax_trend_c(ta.degs, ta.tau, ta.tstart, (h)::BIGINT)
+           END AS ctl
+    FROM _sarimax_fc_targs ta
+),
+-- densified per-horizon observation intercept (exog dot beta; beta lives at
+-- params[ktrend+1 .. ktrend+r]) and trend state intercept
+-- (the horizon column is spelled zh inside this CTE: h is a macro ARGUMENT
+-- of sarimax_forecast and would shadow a same-named GROUP BY column ref)
 _sarimax_fc_dfut AS MATERIALIZED (
-    SELECT 1::BIGINT AS probe_id, zed.t AS h,
-           list_reduce(
-               list_prepend(0e0, list(zed.x * zp.params[zed.j] ORDER BY zed.j)),
-               lambda zacc, zxb: zacc + zxb) AS d
-    FROM _sarimax_fc_exd zed, _sarimax_fc_probe zp
-    GROUP BY zed.t, zp.params
+    SELECT probe_id, zh AS h, sum(zdv) AS d, sum(zct) AS ct
+    FROM (
+        SELECT zp.probe_id, zu.zh AS zh, 0e0 AS zdv, zc.ctl[zu.zh] AS zct
+        FROM _sarimax_fc_probe zp, _sarimax_fc_ct zc,
+             LATERAL unnest(range(1, (h)::BIGINT + 1)) AS zu(zh)
+        UNION ALL
+        SELECT zp.probe_id, zed.t AS zh,
+               list_reduce(
+                   list_prepend(0e0, list(zed.x * zp.params[zdm.ktrend + zed.j] ORDER BY zed.j)),
+                   lambda zacc, zxb: zacc + zxb) AS zdv,
+               0e0 AS zct
+        FROM _sarimax_fc_exd zed, _sarimax_fc_probe zp, _sarimax_fc_dims zdm
+        GROUP BY zp.probe_id, zed.t, zp.params, zdm.ktrend
+    )
+    GROUP BY probe_id, zh
 ),
 _sarimax_fc_diffres AS MATERIALIZED (
-    SELECT * FROM _sarimax_fc_diff('_sarimax_fc_state', '_sarimax_fc_sys', '_sarimax_fc_dfut', h)
+    SELECT * FROM _sarimax_fc_diff_v2('_sarimax_fc_state', '_sarimax_fc_sys', '_sarimax_fc_dfut', h)
 ),
 _sarimax_fc_anch AS MATERIALIZED (
     SELECT split_part(name, ':', 2)::INT AS stage, idx, value
@@ -3889,20 +6229,25 @@ _sarimax_fc_anch AS MATERIALIZED (
 ),
 _sarimax_fc_orig_res AS (
     SELECT * FROM _sarimax_fc_orig('_sarimax_fc_diffres', '_sarimax_fc_anch',
-        (SELECT d FROM _sarimax_fc_dims),
-        (SELECT sd FROM _sarimax_fc_dims),
+        (SELECT d_eff FROM _sarimax_fc_dims),
+        (SELECT sd_eff FROM _sarimax_fc_dims),
         (SELECT s FROM _sarimax_fc_dims), h)
+),
+_sarimax_fc_scale AS (
+    SELECT CASE WHEN zd.conc = 1 THEN _sarimax_m_meta(model, 'sigma2') ELSE 1e0 END AS sc
+    FROM _sarimax_fc_dims zd
 )
 SELECT zdf.h,
        zor.mean_orig AS yhat,
-       sqrt(zor.var_orig) AS se,
-       zor.mean_orig - _sarimax_norm_ppf(0.5e0 + level / 2e0) * sqrt(zor.var_orig) AS lo,
-       zor.mean_orig + _sarimax_norm_ppf(0.5e0 + level / 2e0) * sqrt(zor.var_orig) AS hi,
+       sqrt(zor.var_orig * zs.sc) AS se,
+       zor.mean_orig - _sarimax_norm_ppf(0.5e0 + level / 2e0) * sqrt(zor.var_orig * zs.sc) AS lo,
+       zor.mean_orig + _sarimax_norm_ppf(0.5e0 + level / 2e0) * sqrt(zor.var_orig * zs.sc) AS hi,
        zdf.mean_diff AS yhat_diff,
-       sqrt(zdf.var_diff) AS se_diff
+       sqrt(zdf.var_diff * zs.sc) AS se_diff
 FROM _sarimax_fc_diffres zdf
 JOIN _sarimax_fc_orig_res zor
   ON zor.probe_id = zdf.probe_id AND zor.h = zdf.h
+CROSS JOIN _sarimax_fc_scale zs
 ORDER BY zdf.h;
 
 -- ---- grid runner ------------------------------------------------------------------
