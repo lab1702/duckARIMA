@@ -178,11 +178,29 @@ _sarimax_fcd_chk AS (
                 THEN error('_sarimax_fc_diff: H must be >= 1, got ' || (hmax))
                 ELSE true END AS ok
 ),
+-- densified per-(probe, h) intercept, built WITHOUT any outer join (a
+-- non-inner join on a CTE subquery in this context is a DuckDB "Cannot
+-- perform non-inner join on subquery" error when the dfut table arrives as a
+-- caller CTE rather than a physical table): explicit zero base rows are
+-- union-ed with the actual rows and summed, which equals coalesce(d, 0)
+_sarimax_fcd_df AS MATERIALIZED (
+    SELECT probe_id, h, sum(d) AS d
+    FROM (
+        SELECT st.probe_id, zu.zh AS h, 0e0 AS d
+        FROM query_table(state_tbl) st
+        CROSS JOIN (SELECT unnest(range(1, (hmax)::BIGINT + 1)) AS zh) zu
+        UNION ALL
+        SELECT df.probe_id, df.h, df.d
+        FROM query_table(dfut_tbl) df
+        WHERE df.h <= (hmax)
+    )
+    GROUP BY probe_id, h
+),
 _sarimax_fcd AS (
     SELECT st.probe_id,
            1::BIGINT AS h,
            sy.k AS k,
-           coalesce(df.d, 0e0) + st.a[1] AS mean_diff,
+           df.d + st.a[1] AS mean_diff,
            st.p[1] AS var_diff,
            [st.p[1]]::DOUBLE[] AS omega,
            st.a AS a,
@@ -193,7 +211,7 @@ _sarimax_fcd AS (
                st.p[(zi - 1) * sy.k + 1]) AS pzflat
     FROM query_table(state_tbl) st
     JOIN query_table(sys_tbl) sy ON sy.probe_id = st.probe_id
-    LEFT JOIN query_table(dfut_tbl) df ON df.probe_id = st.probe_id AND df.h = 1
+    JOIN _sarimax_fcd_df df ON df.probe_id = st.probe_id AND df.h = 1
     CROSS JOIN _sarimax_fcd_chk ck
     WHERE ck.ok
     UNION ALL
@@ -224,7 +242,7 @@ _sarimax_fcd AS (
             SELECT fc.probe_id,
                    fc.h + 1 AS h,
                    fc.k AS k,
-                   coalesce(df.d, 0e0) AS dnew,
+                   df.d AS dnew,
                    _sarimax_mmul(sy.tmat, fc.a, fc.k, fc.k, 1) AS anew,
                    _sarimax_madd(
                        _sarimax_mmul(
@@ -242,7 +260,7 @@ _sarimax_fcd AS (
                    fc.pzflat AS pzflat
             FROM _sarimax_fcd fc
             JOIN query_table(sys_tbl) sy ON sy.probe_id = fc.probe_id
-            LEFT JOIN query_table(dfut_tbl) df
+            JOIN _sarimax_fcd_df df
                    ON df.probe_id = fc.probe_id AND df.h = fc.h + 1
             WHERE fc.h < (hmax)
         )
@@ -269,6 +287,12 @@ _sarimax_fo_fc AS MATERIALIZED (
 _sarimax_fo_an AS MATERIALIZED (
     SELECT stage::INT AS stage, idx::INT AS idx, value::DOUBLE AS value
     FROM query_table(anchors_tbl)
+),
+-- scalar args bound as columns: an argument that is a scalar subquery may not
+-- appear inside a non-inner join condition ("Cannot perform non-inner join on
+-- subquery"), so the stage CTEs below reference these columns instead
+_sarimax_fo_args AS MATERIALIZED (
+    SELECT (d)::INT AS zd, (sd)::INT AS zsd, (s)::BIGINT AS zs
 ),
 _sarimax_fo_chk AS (
     SELECT CASE
@@ -307,70 +331,77 @@ _sarimax_fo_chk AS (
 -- ---- mean: seasonal inversions, most recently applied stage first ----------
 _sarimax_fo_s1 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN sd >= 1
-                THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id, (f.h - 1) % s ORDER BY f.h
+           CASE WHEN za.zsd >= 1
+                THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id, (f.h - 1) % za.zs ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_fc f
+    CROSS JOIN _sarimax_fo_args za
     LEFT JOIN _sarimax_fo_an a
-      ON sd >= 1 AND a.stage = d + sd AND a.idx = ((f.h - 1) % s) + 1
+      ON za.zsd >= 1 AND a.stage = za.zd + za.zsd AND a.idx = ((f.h - 1) % za.zs) + 1
 ),
 _sarimax_fo_s2 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN sd >= 2
-                THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id, (f.h - 1) % s ORDER BY f.h
+           CASE WHEN za.zsd >= 2
+                THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id, (f.h - 1) % za.zs ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_s1 f
+    CROSS JOIN _sarimax_fo_args za
     LEFT JOIN _sarimax_fo_an a
-      ON sd >= 2 AND a.stage = d + sd - 1 AND a.idx = ((f.h - 1) % s) + 1
+      ON za.zsd >= 2 AND a.stage = za.zd + za.zsd - 1 AND a.idx = ((f.h - 1) % za.zs) + 1
 ),
 _sarimax_fo_s3 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN sd >= 3
-                THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id, (f.h - 1) % s ORDER BY f.h
+           CASE WHEN za.zsd >= 3
+                THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id, (f.h - 1) % za.zs ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_s2 f
+    CROSS JOIN _sarimax_fo_args za
     LEFT JOIN _sarimax_fo_an a
-      ON sd >= 3 AND a.stage = d + sd - 2 AND a.idx = ((f.h - 1) % s) + 1
+      ON za.zsd >= 3 AND a.stage = za.zd + za.zsd - 2 AND a.idx = ((f.h - 1) % za.zs) + 1
 ),
 -- ---- mean: ordinary inversions, most recently applied stage first ----------
 _sarimax_fo_o1 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN d >= 1
+           CASE WHEN za.zd >= 1
                 THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_s3 f
-    LEFT JOIN _sarimax_fo_an a ON d >= 1 AND a.stage = d AND a.idx = 1
+    CROSS JOIN _sarimax_fo_args za
+    LEFT JOIN _sarimax_fo_an a ON za.zd >= 1 AND a.stage = za.zd AND a.idx = 1
 ),
 _sarimax_fo_o2 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN d >= 2
+           CASE WHEN za.zd >= 2
                 THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_o1 f
-    LEFT JOIN _sarimax_fo_an a ON d >= 2 AND a.stage = d - 1 AND a.idx = 1
+    CROSS JOIN _sarimax_fo_args za
+    LEFT JOIN _sarimax_fo_an a ON za.zd >= 2 AND a.stage = za.zd - 1 AND a.idx = 1
 ),
 _sarimax_fo_o3 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN d >= 3
+           CASE WHEN za.zd >= 3
                 THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_o2 f
-    LEFT JOIN _sarimax_fo_an a ON d >= 3 AND a.stage = d - 2 AND a.idx = 1
+    CROSS JOIN _sarimax_fo_args za
+    LEFT JOIN _sarimax_fo_an a ON za.zd >= 3 AND a.stage = za.zd - 2 AND a.idx = 1
 ),
 _sarimax_fo_o4 AS (
     SELECT f.probe_id, f.h,
-           CASE WHEN d >= 4
+           CASE WHEN za.zd >= 4
                 THEN a.value + sum(f.v) OVER (PARTITION BY f.probe_id ORDER BY f.h
                                               ROWS BETWEEN UNBOUNDED PRECEDING AND CURRENT ROW)
                 ELSE f.v END AS v
     FROM _sarimax_fo_o3 f
-    LEFT JOIN _sarimax_fo_an a ON d >= 4 AND a.stage = d - 3 AND a.idx = 1
+    CROSS JOIN _sarimax_fo_args za
+    LEFT JOIN _sarimax_fo_an a ON za.zd >= 4 AND a.stage = za.zd - 3 AND a.idx = 1
 ),
 -- ---- variance: integration-weights double fold over the Omega rows ---------
 _sarimax_fo_wl AS (

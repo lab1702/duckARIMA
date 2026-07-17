@@ -40,7 +40,7 @@ FROM generate_series(97, 108) AS g(t);
 
 -- ---- fit ---------------------------------------------------------------------
 CREATE OR REPLACE TABLE smoke_model AS
-SELECT * FROM sarimax_fit('smoke_data', 'y', 1, 1, 1, exog_cols := ['x1', 'x2']);
+SELECT * FROM sarimax_fit('smoke_data', 'y', 1, 1, 1, exog_cols := ['x1', 'x2'], t_col := 't');
 
 -- invariant: converged, finite loglik
 SELECT CASE
@@ -61,7 +61,9 @@ SELECT CASE
 
 -- ---- forecast ------------------------------------------------------------------
 CREATE OR REPLACE TABLE smoke_fc AS
-SELECT * FROM sarimax_forecast('smoke_model', 'smoke_data', 'y', 12, newdata := 'smoke_future');
+SELECT * FROM sarimax_forecast('smoke_model', 'smoke_data', 'y', 12,
+                               newdata := 'smoke_future', exog_cols := ['x1', 'x2'],
+                               t_col := 't');
 
 SELECT CASE
     WHEN (SELECT count(*) FROM smoke_fc) <> 12
@@ -87,7 +89,7 @@ SELECT CASE
     ELSE 'SMOKE OK: summary rows' END AS check_7;
 
 SELECT CASE
-    WHEN NOT isfinite((SELECT aic FROM sarimax_evaluate('smoke_model', 'smoke_data', 'y')))
+    WHEN NOT isfinite((SELECT aic FROM sarimax_evaluate('smoke_model', 'smoke_data', 'y', exog_cols := ['x1', 'x2'], t_col := 't')))
     THEN error('smoke: aic not finite')
     ELSE 'SMOKE OK: evaluate' END AS check_8;
 

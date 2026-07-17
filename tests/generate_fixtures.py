@@ -9,6 +9,14 @@ Pinned model options for every fixture (spec section 8):
     concentrate_scale=False, hamilton_representation=False, measurement_error=False,
     mle_regression=True, trend='n'
 
+Additionally pinned: ssm.tolerance = 0 (Kalman-filter convergence FREEZING DISABLED).
+statsmodels' default tolerance=1e-19 freezes K/F once the covariance recursion is
+judged converged; the frozen gain then differs from the exactly-recursed gain by up
+to ~1e-7 near the invertibility boundary, perturbing v_t at up to ~1e-6 -- observed
+directly on the arma_1_0_1 fixture (probe 23: freeze at t=180, v divergence 1.6e-6).
+That approximation is incompatible with the T1 per-step 1e-9 contract; the exact
+(never-frozen) filter is the correct reference and is what the SQL implements.
+
 Fixture regeneration policy: NEVER silently (spec section 10/12). If a fixture looks
 wrong, reproduce the discrepancy in a standalone statsmodels snippet first, document
 the cause, then regenerate deliberately.
@@ -261,6 +269,7 @@ def build_fixture(fx: Fixture):
 
     model = SARIMAX(fx.y, exog=fx.exog, order=fx.order,
                     seasonal_order=fx.seasonal_order, **PINNED_OPTIONS)
+    model.ssm.tolerance = 0.0        # exact filter: no convergence freezing (see module docstring)
     assert model.ssm.loglikelihood_burn == 0, "stationary init expected (burn 0)"
     n_eff = model.nobs
     assert n_eff == n - d - D * s

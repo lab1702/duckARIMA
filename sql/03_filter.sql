@@ -45,20 +45,29 @@
 -- Returns (probe_id, k, tmat, tmat_t, rqr, p1): time-invariant system per
 -- probe. Probes differing only in beta share one construction + Lyapunov solve.
 CREATE OR REPLACE MACRO _sarimax_systems(probes_tbl, r, p, q, bigp, bigq, s) AS TABLE
-WITH _sarimax_sys_arma AS (
+WITH _sarimax_sys_args AS (
+    -- bind scalar args to columns once: an argument that is a scalar subquery
+    -- (e.g. read from a model table) may not land inside a lambda body, so
+    -- everything downstream references these columns instead
+    SELECT r::INT AS zr, p::INT AS zp, q::INT AS zq,
+           bigp::INT AS zbp, bigq::INT AS zbq, s::BIGINT AS zs
+),
+_sarimax_sys_arma AS (
     SELECT DISTINCT
-        list_slice(params, r + 1, r + p + q + bigp + bigq + 1) AS armav
+        za.zp, za.zq, za.zbp, za.zbq, za.zs,
+        list_slice(params, za.zr + 1, za.zr + za.zp + za.zq + za.zbp + za.zbq + 1) AS armav
     FROM query_table(probes_tbl)
+    CROSS JOIN _sarimax_sys_args za
 ),
 _sarimax_sys_poly AS (
     SELECT
         armav,
-        _sarimax_k_states(p, q, bigp, bigq, s) AS k,
-        _sarimax_expand_ar(list_slice(armav, 1, p),
-                           list_slice(armav, p + q + 1, p + q + bigp), s) AS phistar,
-        _sarimax_expand_ma(list_slice(armav, p + 1, p + q),
-                           list_slice(armav, p + q + bigp + 1, p + q + bigp + bigq), s) AS thetastar,
-        armav[p + q + bigp + bigq + 1] AS sigma2
+        _sarimax_k_states(zp, zq, zbp, zbq, zs) AS k,
+        _sarimax_expand_ar(list_slice(armav, 1, zp),
+                           list_slice(armav, zp + zq + 1, zp + zq + zbp), zs) AS phistar,
+        _sarimax_expand_ma(list_slice(armav, zp + 1, zp + zq),
+                           list_slice(armav, zp + zq + zbp + 1, zp + zq + zbp + zbq), zs) AS thetastar,
+        armav[zp + zq + zbp + zbq + 1] AS sigma2
     FROM _sarimax_sys_arma
 ),
 _sarimax_sys_tr AS (

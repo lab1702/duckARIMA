@@ -22,7 +22,8 @@ SELECT * FROM sarimax_summary('m', 'sales', 'units');
 
 -- future_regressors(month, promo, price) must hold the next 12 rows
 SELECT * FROM sarimax_forecast('m', 'sales', 'units', 12,
-                               newdata := 'future_regressors', t_col := 'month');
+                               newdata := 'future_regressors',
+                               exog_cols := ['promo', 'price'], t_col := 'month');
 ```
 
 The model table `m` is self-contained: forecasting, summary, and evaluation
@@ -87,6 +88,15 @@ behavior", recorded here so nothing is implicit in code:
    gradient criterion; `restarted = 1` flags the one perturbed restart.
 10. **Seasonal argument names**: `sp/sd/sq` stand in for P/D/Q because DuckDB
     macro parameters are case-insensitive.
+11. **Re-supplying `exog_cols`**: the forecast/diagnostics macros take the
+    regressor column names again as a literal list (struct-field access in
+    DuckDB requires constant keys, so names stored in the model table cannot
+    drive extraction); the list is validated against the stored names. At
+    most 12 exogenous columns are supported.
+12. **Grid search**: `sarimax_grid_sql(data, y_col, orders)` returns the SQL
+    text that fits every row of the orders table and ranks by AIC (DuckDB
+    cannot correlate table-macro arguments through a lateral join, so the
+    grid runs as a generated statement).
 
 ## 4. The model table, column by column
 

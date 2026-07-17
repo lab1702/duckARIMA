@@ -3,7 +3,7 @@
 --
 -- Public macros (duckLM-style; table names as strings via query_table):
 --   sarimax_fit(data, y_col, p, d, q, sp := 0, sd := 0, sq := 0, s := 1,
---               exog_cols := [], t_col := NULL)          -> model table
+--               exog_cols := []::VARCHAR[], t_col := NULL)          -> model table
 --   sarimax_forecast(model, data, y_col, h, newdata := NULL, t_col := NULL,
 --                    level := 0.95)                      -> forecasts
 --   sarimax_summary(model, data, y_col)                  -> coefficient table
@@ -156,33 +156,120 @@ CREATE OR REPLACE MACRO _sarimax_validate_spec(p, d, q, sp, sd, sq, s) AS (
 -- ---- internal: series / exog extraction from a user table ----------------------
 
 -- (t, y) with t = 1..n by t_col order (or natural order when t_col is NULL).
+-- struct_extract requires a CONSTANT key, hence the coalesce guard: when
+-- t_col is NULL the CASE never reads the extracted value, but the branch must
+-- still bind against a valid constant column name.
 CREATE OR REPLACE MACRO _sarimax_series_of(data, y_col, t_col) AS TABLE
 SELECT row_number() OVER (
            ORDER BY CASE WHEN t_col IS NULL THEN 0e0
-                         ELSE struct_extract(zd, t_col)::DOUBLE END) AS t,
+                         ELSE struct_extract(zd, coalesce(t_col, y_col))::DOUBLE END) AS t,
        struct_extract(zd, y_col)::DOUBLE AS y
 FROM query_table(data) zd;
 
--- Long-form exog (t, j, x) from named columns; zero rows when the list is empty.
-CREATE OR REPLACE MACRO _sarimax_exog_of(data, exog_cols, t_col) AS TABLE
-SELECT zs.t, zc.j::INT AS j, struct_extract(zs.zd, zc.cname)::DOUBLE AS x
+-- Long-form exog (t, j, x) from named columns; zero rows when the list is
+-- empty. struct_extract keys must be constants, so the column dispatch is a
+-- CASE over constant list positions -- which caps the supported number of
+-- regressors at 12 (documented; raise by extending the CASE).
+CREATE OR REPLACE MACRO _sarimax_exog_x(zd, exog_cols, y_col, zj) AS (
+    CASE zj
+        WHEN 1  THEN struct_extract(zd, coalesce(exog_cols[1]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 2  THEN struct_extract(zd, coalesce(exog_cols[2]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 3  THEN struct_extract(zd, coalesce(exog_cols[3]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 4  THEN struct_extract(zd, coalesce(exog_cols[4]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 5  THEN struct_extract(zd, coalesce(exog_cols[5]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 6  THEN struct_extract(zd, coalesce(exog_cols[6]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 7  THEN struct_extract(zd, coalesce(exog_cols[7]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 8  THEN struct_extract(zd, coalesce(exog_cols[8]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 9  THEN struct_extract(zd, coalesce(exog_cols[9]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 10 THEN struct_extract(zd, coalesce(exog_cols[10]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 11 THEN struct_extract(zd, coalesce(exog_cols[11]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        WHEN 12 THEN struct_extract(zd, coalesce(exog_cols[12]::VARCHAR, exog_cols[1]::VARCHAR, y_col))::DOUBLE
+        ELSE error('sarimax: at most 12 exogenous columns are supported')
+    END
+);
+
+CREATE OR REPLACE MACRO _sarimax_exog_of(data, exog_cols, y_col, t_col) AS TABLE
+SELECT zs.t, zc.j::INT AS j, _sarimax_exog_x(zs.zd, exog_cols, y_col, zc.j) AS x
 FROM (
     SELECT row_number() OVER (
                ORDER BY CASE WHEN t_col IS NULL THEN 0e0
-                             ELSE struct_extract(zd, t_col)::DOUBLE END) AS t,
+                             ELSE struct_extract(zd, coalesce(t_col, y_col))::DOUBLE END) AS t,
            zd
     FROM query_table(data) zd
 ) zs
 CROSS JOIN (
-    SELECT unnest(exog_cols) AS cname,
-           unnest(range(1, len(exog_cols) + 1)) AS j
+    SELECT unnest(range(1, len(exog_cols) + 1)) AS j
 ) zc;
+
+-- ---- dynamic-order differencing -------------------------------------------------
+-- Layer 1's _sarimax_diff uses window lag(x, s), whose offset must be a
+-- constant -- fine for sarimax_fit (orders arrive as literals) but not for
+-- macros that read the orders back out of a model table (scalar subqueries).
+-- These variants difference by explicit convolution with the coefficients of
+-- (1-L)^d (1-L^s)^D: algebraically identical, floating-point-equal to ~1 ulp
+-- (summation order differs from sequential differencing), and used ONLY on
+-- the model-table-driven paths (residual diagnostics, forecasting).
+
+-- Coefficient list of (1-L)^d (1-L^s)^D, constant term first.
+CREATE OR REPLACE MACRO _sarimax_diff_poly(zd, zsd, zs) AS (
+    _sarimax_polymul(
+        list_reduce(
+            [[1e0]] || list_transform(range(1, zd + 1), lambda zi: [[1e0]][1]),
+            lambda zacc, ze: _sarimax_polymul(zacc, [1e0, -1e0])),
+        list_reduce(
+            [[1e0]] || list_transform(range(1, zsd + 1), lambda zi: [[1e0]][1]),
+            lambda zacc, ze: _sarimax_polymul(
+                zacc,
+                list_append(list_prepend(1e0, list_transform(range(1, zs), lambda zz: 0e0)),
+                            -1e0)))
+    )
+);
+
+CREATE OR REPLACE MACRO _sarimax_diff_dyn(tbl, tcol, ycol, d, sd, s) AS TABLE
+WITH _sarimax_dd_args AS (
+    SELECT d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs
+),
+_sarimax_dd_list AS (
+    SELECT za.zd + za.zsd * za.zs AS zoff,
+           _sarimax_diff_poly(za.zd, za.zsd, greatest(za.zs, 1)) AS zc,
+           (SELECT list(struct_extract(zrow, ycol)::DOUBLE
+                        ORDER BY struct_extract(zrow, tcol)) FROM query_table(tbl) zrow) AS zy
+    FROM _sarimax_dd_args za
+)
+SELECT zu.zt AS t,
+       list_reduce(
+           list_prepend(0e0, list_transform(range(1, len(zl.zc) + 1), lambda zi:
+               zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)])),
+           lambda zacc, zx: zacc + zx) AS w
+FROM _sarimax_dd_list zl,
+     LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
+
+CREATE OR REPLACE MACRO _sarimax_diff_exog_dyn(tbl, d, sd, s) AS TABLE
+WITH _sarimax_de_args AS (
+    SELECT d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs
+),
+_sarimax_de_lists AS (
+    SELECT ze.j,
+           za.zd + za.zsd * za.zs AS zoff,
+           _sarimax_diff_poly(za.zd, za.zsd, greatest(za.zs, 1)) AS zc,
+           list(ze.x ORDER BY ze.t) AS zy
+    FROM query_table(tbl) ze
+    CROSS JOIN _sarimax_de_args za
+    GROUP BY ze.j, za.zd, za.zsd, za.zs
+)
+SELECT zu.zt AS t, zl.j,
+       list_reduce(
+           list_prepend(0e0, list_transform(range(1, len(zl.zc) + 1), lambda zi:
+               zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)])),
+           lambda zacc, zx: zacc + zx) AS x
+FROM _sarimax_de_lists zl,
+     LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
 
 -- ---- the fit --------------------------------------------------------------------
 
 CREATE OR REPLACE MACRO sarimax_fit(data, y_col, p, d, q,
                                     sp := 0, sd := 0, sq := 0, s := 1,
-                                    exog_cols := [], t_col := NULL) AS TABLE
+                                    exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 WITH _sarimax_f_chk AS (
     SELECT _sarimax_validate_spec(p, d, q, sp, sd, sq, s) AS ok
 ),
@@ -190,7 +277,7 @@ _sarimax_f_series AS (
     SELECT t, y FROM _sarimax_series_of(data, y_col, t_col)
 ),
 _sarimax_f_exog AS (
-    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, t_col)
+    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
 _sarimax_f_w AS (
     SELECT t, w FROM _sarimax_diff('_sarimax_f_series', 't', 'y', d, sd, s)
@@ -232,9 +319,11 @@ _sarimax_f_lists AS (
                    END) AS xmat
 ),
 _sarimax_f_bse AS (
-    SELECT _sarimax_bse(ft.params, dl.wlist, dl.xmat,
-                        len(exog_cols), p, q, sp, sq, greatest(s, 1)) AS bse
-    FROM _sarimax_f_fit ft, _sarimax_f_lists dl
+    SELECT bse FROM _sarimax_bse(
+        (SELECT params FROM _sarimax_f_fit),
+        (SELECT wlist FROM _sarimax_f_lists),
+        (SELECT xmat FROM _sarimax_f_lists),
+        len(exog_cols), p, q, sp, sq, greatest(s, 1))
 ),
 _sarimax_f_names AS (
     SELECT list_transform(range(1, dm.k_params + 1), lambda zi:
@@ -338,28 +427,41 @@ ORDER BY pm.idx;
 
 -- ---- residuals / evaluate / ljung-box ----------------------------------------------
 
+-- Names of the exogenous columns must be re-supplied as a LITERAL list by the
+-- caller (struct field access requires constant keys in DuckDB); they are
+-- validated against the names stored in the model table.
+CREATE OR REPLACE MACRO _sarimax_check_exog_names(model, exog_cols) AS (
+    CASE WHEN (SELECT coalesce(list(name ORDER BY idx), [])
+               FROM query_table(model) WHERE kind = 'exog_col') = exog_cols
+         THEN true
+         ELSE error('sarimax: exog_cols does not match the columns the model was fit with: '
+                    || (SELECT coalesce(string_agg(name, ', ' ORDER BY idx), '(none)')
+                        FROM query_table(model) WHERE kind = 'exog_col')) END
+);
+
 -- Recompute the innovation trace at theta-hat from the data + model table.
-CREATE OR REPLACE MACRO _sarimax_retrace(model, data, y_col, t_col) AS TABLE
-WITH _sarimax_rt_series AS (
-    SELECT t, y FROM _sarimax_series_of(data, y_col, t_col)
+CREATE OR REPLACE MACRO _sarimax_retrace(model, data, y_col, exog_cols, t_col) AS TABLE
+WITH _sarimax_rt_chk AS (
+    SELECT _sarimax_check_exog_names(model, exog_cols) AS ok
+),
+_sarimax_rt_series AS (
+    SELECT zs.t, zs.y FROM _sarimax_series_of(data, y_col, t_col) zs, _sarimax_rt_chk zc
+    WHERE zc.ok
 ),
 _sarimax_rt_exog AS (
-    SELECT t, j, x FROM _sarimax_exog_of(
-        data,
-        (SELECT coalesce(list(name ORDER BY idx), []) FROM query_table(model) WHERE kind = 'exog_col'),
-        t_col)
+    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
 _sarimax_rt_w AS (
-    SELECT t, w FROM _sarimax_diff('_sarimax_rt_series', 't', 'y', p := NULL,
-        d := _sarimax_m_spec(model, 'd')::INT,
-        sd := _sarimax_m_spec(model, 'sd')::INT,
-        s := _sarimax_m_spec(model, 's')::INT)
+    SELECT t, w FROM _sarimax_diff_dyn('_sarimax_rt_series', 't', 'y',
+        _sarimax_m_spec(model, 'd'),
+        _sarimax_m_spec(model, 'sd'),
+        _sarimax_m_spec(model, 's'))
 ),
 _sarimax_rt_exd AS (
-    SELECT t, j, x FROM _sarimax_diff_exog('_sarimax_rt_exog',
-        _sarimax_m_spec(model, 'd')::INT,
-        _sarimax_m_spec(model, 'sd')::INT,
-        _sarimax_m_spec(model, 's')::INT)
+    SELECT t, j, x FROM _sarimax_diff_exog_dyn('_sarimax_rt_exog',
+        _sarimax_m_spec(model, 'd'),
+        _sarimax_m_spec(model, 'sd'),
+        _sarimax_m_spec(model, 's'))
 ),
 _sarimax_rt_probe AS (
     SELECT 1::BIGINT AS probe_id, _sarimax_m_params(model) AS params
@@ -379,15 +481,15 @@ _sarimax_rt_obs AS (
 SELECT t, v, f, v / sqrt(f) AS std_resid
 FROM _sarimax_kfilter('_sarimax_rt_obs', '_sarimax_rt_sys');
 
-CREATE OR REPLACE MACRO sarimax_residuals(model, data, y_col, t_col := NULL) AS TABLE
+CREATE OR REPLACE MACRO sarimax_residuals(model, data, y_col, exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 SELECT t, v, f, std_resid
-FROM _sarimax_retrace(model, data, y_col, t_col)
+FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)
 ORDER BY t;
 
 -- Ljung-Box Q on the standardized innovations at the exact lag set 1..nlags.
-CREATE OR REPLACE MACRO sarimax_ljungbox(model, data, y_col, nlags, t_col := NULL) AS TABLE
+CREATE OR REPLACE MACRO sarimax_ljungbox(model, data, y_col, nlags, exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 WITH _sarimax_lb_sr AS (
-    SELECT t, std_resid FROM _sarimax_retrace(model, data, y_col, t_col)
+    SELECT t, std_resid FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)
 ),
 _sarimax_lb_acf AS (
     SELECT lag, acf FROM _sarimax_acf('_sarimax_lb_sr', 't', 'std_resid', nlags)
@@ -408,22 +510,28 @@ SELECT lag, stat, _sarimax_chi2_sf(stat, lag::DOUBLE) AS pvalue
 FROM _sarimax_lb_q
 ORDER BY lag;
 
-CREATE OR REPLACE MACRO sarimax_evaluate(model, data, y_col, t_col := NULL) AS TABLE
+CREATE OR REPLACE MACRO sarimax_evaluate(model, data, y_col, exog_cols := []::VARCHAR[], t_col := NULL) AS TABLE
 SELECT _sarimax_m_meta(model, 'loglik') AS loglik,
        _sarimax_m_meta(model, 'aic') AS aic,
        _sarimax_m_meta(model, 'bic') AS bic,
        _sarimax_m_meta(model, 'sigma2') AS sigma2,
        _sarimax_m_spec(model, 'n_eff') AS n_eff,
        (SELECT 1e0 - (count(*) FILTER (WHERE NOT isfinite(std_resid)))::DOUBLE / count(*)
-        FROM _sarimax_retrace(model, data, y_col, t_col)) AS resid_finite_frac,
+        FROM _sarimax_retrace(model, data, y_col, exog_cols, t_col)) AS resid_finite_frac,
        _sarimax_m_meta(model, 'converged') AS converged;
 
 -- ---- forecast -----------------------------------------------------------------------
 
 CREATE OR REPLACE MACRO sarimax_forecast(model, data, y_col, h,
-                                         newdata := NULL, t_col := NULL,
-                                         level := 0.95) AS TABLE
-WITH _sarimax_fc_dims AS (
+                                         newdata := NULL, exog_cols := []::VARCHAR[],
+                                         t_col := NULL, level := 0.95) AS TABLE
+WITH _sarimax_fc_chk AS (
+    SELECT _sarimax_check_exog_names(model, exog_cols)
+           AND CASE WHEN len(exog_cols) > 0 AND newdata IS NULL
+                    THEN error('sarimax: the model has exogenous regressors; supply future values via newdata')
+                    ELSE true END AS ok
+),
+_sarimax_fc_dims AS (
     SELECT _sarimax_m_spec(model, 'r')::INT AS r,
            _sarimax_m_spec(model, 'p')::INT AS p,
            _sarimax_m_spec(model, 'q')::INT AS q,
@@ -433,11 +541,13 @@ WITH _sarimax_fc_dims AS (
            _sarimax_m_spec(model, 's')::INT AS s,
            _sarimax_m_spec(model, 'd')::INT AS d,
            _sarimax_m_spec(model, 'n_eff')::BIGINT AS n_eff
+    FROM _sarimax_fc_chk
+    WHERE ok
 ),
-_sarimax_fc_probe AS (
+_sarimax_fc_probe AS MATERIALIZED (
     SELECT 1::BIGINT AS probe_id, _sarimax_m_params(model) AS params
 ),
-_sarimax_fc_sys AS (
+_sarimax_fc_sys AS MATERIALIZED (
     SELECT * FROM _sarimax_systems('_sarimax_fc_probe',
         _sarimax_m_spec(model, 'r')::INT,
         _sarimax_m_spec(model, 'p')::INT,
@@ -446,7 +556,7 @@ _sarimax_fc_sys AS (
         _sarimax_m_spec(model, 'sq')::INT,
         greatest(_sarimax_m_spec(model, 's')::INT, 1))
 ),
-_sarimax_fc_state AS (
+_sarimax_fc_state AS MATERIALIZED (
     SELECT 1::BIGINT AS probe_id,
            (SELECT n_eff FROM _sarimax_fc_dims) AS n_eff,
            (SELECT value_list FROM query_table(model) WHERE kind = 'state' AND name = 'a') AS a,
@@ -463,21 +573,19 @@ _sarimax_fc_exfull AS (
     SELECT zx.j,
            (SELECT max(zd2.d + zd2.sd * zd2.s) FROM _sarimax_fc_dims zd2) + zx.t,
            zx.x, 1
-    FROM _sarimax_exog_of(newdata,
-        (SELECT coalesce(list(name ORDER BY idx), []) FROM query_table(model) WHERE kind = 'exog_col'),
-        t_col) zx
+    FROM _sarimax_exog_of(coalesce(newdata, data), exog_cols, y_col, t_col) zx
 ),
 _sarimax_fc_exfull2 AS (
     SELECT tt AS t, j, x FROM _sarimax_fc_exfull
 ),
-_sarimax_fc_exd AS (
+_sarimax_fc_exd AS MATERIALIZED (
     SELECT zz.t, zz.j, zz.x
-    FROM _sarimax_diff_exog('_sarimax_fc_exfull2',
+    FROM _sarimax_diff_exog_dyn('_sarimax_fc_exfull2',
         (SELECT d FROM _sarimax_fc_dims),
         (SELECT sd FROM _sarimax_fc_dims),
         (SELECT s FROM _sarimax_fc_dims)) zz
 ),
-_sarimax_fc_dfut AS (
+_sarimax_fc_dfut AS MATERIALIZED (
     SELECT 1::BIGINT AS probe_id, zed.t AS h,
            list_reduce(
                list_prepend(0e0, list(zed.x * zp.params[zed.j] ORDER BY zed.j)),
@@ -485,10 +593,10 @@ _sarimax_fc_dfut AS (
     FROM _sarimax_fc_exd zed, _sarimax_fc_probe zp
     GROUP BY zed.t, zp.params
 ),
-_sarimax_fc_diffres AS (
+_sarimax_fc_diffres AS MATERIALIZED (
     SELECT * FROM _sarimax_fc_diff('_sarimax_fc_state', '_sarimax_fc_sys', '_sarimax_fc_dfut', h)
 ),
-_sarimax_fc_anch AS (
+_sarimax_fc_anch AS MATERIALIZED (
     SELECT split_part(name, ':', 2)::INT AS stage, idx, value
     FROM query_table(model) WHERE kind = 'anchor' AND name LIKE 'endog:%'
 ),
@@ -509,3 +617,31 @@ FROM _sarimax_fc_diffres zdf
 JOIN _sarimax_fc_orig_res zor
   ON zor.probe_id = zdf.probe_id AND zor.h = zdf.h
 ORDER BY zdf.h;
+
+-- ---- grid runner ------------------------------------------------------------------
+
+-- DuckDB cannot correlate table-macro arguments through a LATERAL join (the
+-- macro stack misbinds), so the order-grid runner follows duckLM's
+-- dummy_encode_sql precedent: it RETURNS THE SQL TEXT that fits every row of
+-- the orders table and ranks by AIC; run it as a second step:
+--     SELECT sarimax_grid_sql('sales', 'units', 'orders');   -- copy the text
+-- or from the CLI:  .once grid.sql  /  SELECT ...;  /  .read grid.sql
+-- The orders table must have columns (p, d, q, sp, sd, sq, s).
+CREATE OR REPLACE MACRO sarimax_grid_sql(data, y_col, orders, t_col := NULL) AS (
+    (SELECT string_agg(
+        'SELECT ' || zo.p || ' AS p, ' || zo.d || ' AS d, ' || zo.q || ' AS q, '
+                  || zo.sp || ' AS sp, ' || zo.sd || ' AS sd, ' || zo.sq || ' AS sq, '
+                  || zo.s || ' AS s, '
+                  || 'max(CASE WHEN name = ''loglik'' THEN value END) AS loglik, '
+                  || 'max(CASE WHEN name = ''aic'' THEN value END) AS aic, '
+                  || 'max(CASE WHEN name = ''bic'' THEN value END) AS bic, '
+                  || 'max(CASE WHEN name = ''converged'' THEN value END) AS converged '
+                  || 'FROM sarimax_fit(' || '''' || data || ''', ''' || y_col || ''', '
+                  || zo.p || ', ' || zo.d || ', ' || zo.q
+                  || ', sp := ' || zo.sp || ', sd := ' || zo.sd || ', sq := ' || zo.sq
+                  || ', s := ' || zo.s
+                  || CASE WHEN t_col IS NULL THEN '' ELSE ', t_col := ''' || t_col || '''' END
+                  || ') WHERE kind = ''meta''',
+        ' UNION ALL ' ORDER BY zo.p, zo.d, zo.q, zo.sp, zo.sd, zo.sq, zo.s)
+     FROM query_table(orders) zo) || ' ORDER BY aic'
+);

@@ -34,7 +34,8 @@ CREATE TABLE m AS SELECT * FROM sarimax_fit('sales', 'units', 0, 1, 1,
 
 SELECT * FROM sarimax_summary('m', 'sales', 'units');          -- coefficients, SEs, z, p, CIs
 SELECT * FROM sarimax_forecast('m', 'sales', 'units', 12,
-                               newdata := 'future_regressors'); -- h, yhat, se, lo, hi
+                               newdata := 'future_regressors',
+                               exog_cols := ['promo', 'price']); -- h, yhat, se, lo, hi
 SELECT * FROM sarimax_evaluate('m', 'sales', 'units');          -- loglik, AIC, BIC, sigma2
 ```
 
