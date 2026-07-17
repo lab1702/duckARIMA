@@ -46,9 +46,10 @@ def test_cli_smoke_sql_passes():
     """The pure-SQL path: duckdb < tests/smoke.sql from the project root."""
     with open(os.path.join(HERE, "smoke.sql"), encoding="utf-8") as f:
         script = f.read()
-    r = subprocess.run(["duckdb"], input=script, capture_output=True,
-                       text=True, cwd=ROOT, timeout=1200)
-    out = r.stdout + r.stderr
+    r = subprocess.run(["duckdb"], input=script.encode("utf-8"),
+                       capture_output=True, cwd=ROOT, timeout=1200)
+    out = (r.stdout or b"").decode("utf-8", errors="replace") \
+        + (r.stderr or b"").decode("utf-8", errors="replace")
     assert r.returncode == 0, f"smoke.sql failed:\n{out[-3000:]}"
     assert "SMOKE TEST PASSED" in out, f"smoke.sql did not pass:\n{out[-3000:]}"
     assert "Deprecated" not in out and "deprecated" not in out, \
