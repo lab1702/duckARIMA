@@ -16,7 +16,8 @@
 -- Loglikelihood accumulates over ALL t (loglikelihood_burn = 0):
 --   ll = -1/2 sum_t (ln 2 pi + ln F_t + v_t^2 / F_t)
 -- carried incrementally through the recursion, i.e. summed in strict t order
--- (spec 4.2 determinism).
+-- (spec 4.2 determinism). The reference is statsmodels' EXACT filter
+-- (fixtures pin ssm.tolerance = 0: no convergence freezing of K and F).
 --
 -- Numeric guard (spec 4.3 / 6): F_t <= 0 poisons that probe's loglik term to
 -- NULL, which propagates through the accumulator so the probe's final ll is
@@ -28,55 +29,21 @@
 -- perturbations of beta -- share one system construction and Lyapunov solve
 -- (the DISTINCT arma-block join below).
 --
+-- IMPLEMENTATION NOTE (the k^5 trap): DuckDB macro expansion is textual, so a
+-- macro argument referenced inside a lambda is re-evaluated per element.
+-- Nesting the covariance update as msym(madd(msub(mmul(...), ...), ...))
+-- would re-expand the k^3 matrix product per output element. Every stage is
+-- therefore bound as its OWN COLUMN of a nested derived table, so every macro
+-- call below receives only plain column references.
+--
 -- Requires: sql/00_linalg.sql, sql/02_ssm.sql.
 -- ============================================================================
-
--- ---- per-step update, chained so intermediates are computed once ------------
-
--- Final assembly: v, f, TP = T*P, tpz = TP e_1 (un-normalized gain), ta = T*a
--- all precomputed by the stages below. K = tpz/f.
-CREATE OR REPLACE MACRO _sarimax_kf_step3(tmat, rqr, k, v, f, tp, tpz, ta) AS (
-    struct_pack(
-        v := v,
-        f := f,
-        anew := list_transform(range(1, k + 1),
-                               lambda i: ta[i] + tpz[i] * v / f),
-        pnew := _sarimax_msym(
-            _sarimax_madd(
-                _sarimax_msub(
-                    _sarimax_mmul(tp, _sarimax_mtrans(tmat, k, k), k, k, k),
-                    list_transform(range(1, k * k + 1), lambda idx:
-                        tpz[(idx - 1) // k + 1] * tpz[(idx - 1) % k + 1] / f)),
-                rqr),
-            k),
-        term := CASE WHEN f > 0.0::DOUBLE
-                     THEN -0.5::DOUBLE * (ln(2.0::DOUBLE * pi()) + ln(f) + v * v / f)
-                     ELSE NULL END)
-);
-
--- Stage 2: with v, f, TP in hand, derive TP e_1 (the un-normalized gain) and
--- T a, then assemble.
-CREATE OR REPLACE MACRO _sarimax_kf_step2(a, tmat, rqr, k, v, f, tp) AS (
-    _sarimax_kf_step3(
-        tmat, rqr, k, v, f, tp,
-        list_transform(range(1, k + 1), lambda i: tp[(i - 1) * k + 1]),
-        _sarimax_mmul(tmat, a, k, k, 1))
-);
-
--- Stage 1: innovation, innovation variance, and TP = T P (computed once).
-CREATE OR REPLACE MACRO _sarimax_kf_step(a, p, tmat, rqr, yd, k) AS (
-    _sarimax_kf_step2(
-        a, tmat, rqr, k,
-        yd - a[1],
-        p[1],
-        _sarimax_mmul(tmat, p, k, k, k))
-);
 
 -- ---- system construction per probe (shares work across identical ARMA blocks)
 
 -- probes_tbl: (probe_id BIGINT, params DOUBLE[]) in canonical parameter order.
--- Returns (probe_id, k, tmat, rqr, p1): the time-invariant system per probe.
--- Probes differing only in beta share one construction + Lyapunov solve.
+-- Returns (probe_id, k, tmat, tmat_t, rqr, p1): time-invariant system per
+-- probe. Probes differing only in beta share one construction + Lyapunov solve.
 CREATE OR REPLACE MACRO _sarimax_systems(probes_tbl, r, p, q, bigp, bigq, s) AS TABLE
 WITH _sarimax_sys_arma AS (
     SELECT DISTINCT
@@ -102,15 +69,16 @@ _sarimax_sys_tr AS (
 ),
 _sarimax_sys_rqr AS (
     SELECT armav, k, tmat,
+           _sarimax_mtrans(tmat, k, k) AS tmat_t,
            _sarimax_build_rqr(rvec, sigma2, k) AS rqr
     FROM _sarimax_sys_tr
 ),
 _sarimax_sys_full AS (
-    SELECT armav, k, tmat, rqr,
+    SELECT armav, k, tmat, tmat_t, rqr,
            _sarimax_lyap(tmat, rqr, k) AS p1
     FROM _sarimax_sys_rqr
 )
-SELECT pr.probe_id, b.k, b.tmat, b.rqr, b.p1
+SELECT pr.probe_id, b.k, b.tmat, b.tmat_t, b.rqr, b.p1
 FROM query_table(probes_tbl) pr
 JOIN _sarimax_sys_full b
   ON b.armav = list_slice(pr.params, r + 1, r + p + q + bigp + bigq + 1);
@@ -139,7 +107,7 @@ LEFT JOIN _sarimax_oa_int di
 -- ---- the filter ---------------------------------------------------------------
 
 -- obs_tbl: (probe_id BIGINT, t BIGINT, yd DOUBLE), t dense 1..n_eff per probe.
--- sys_tbl: (probe_id BIGINT, k, tmat, rqr, p1).
+-- sys_tbl: (probe_id BIGINT, k, tmat, tmat_t, rqr, p1).
 -- Returns the full trace (probe_id, t, v, f, ll_acc) for t = 1..n_eff, where
 -- ll_acc is the running loglikelihood through step t (strict t-order fold).
 CREATE OR REPLACE MACRO _sarimax_kfilter(obs_tbl, sys_tbl) AS TABLE
@@ -153,23 +121,51 @@ WITH RECURSIVE _sarimax_kf USING KEY (probe_id, t) AS (
            0.0::DOUBLE AS ll_acc
     FROM query_table(sys_tbl) s
     UNION ALL
-    SELECT q.probe_id, q.t,
-           (q.upd).anew AS a, (q.upd).pnew AS p,
-           (q.upd).v AS v, (q.upd).f AS f,
-           q.ll_acc + (q.upd).term AS ll_acc
+    SELECT probe_id, t,
+           list_transform(range(1, k + 1), lambda i: ta[i] + tpz[i] * v / f) AS a,
+           _sarimax_msym(prqr, k) AS p,
+           v, f,
+           ll_acc + CASE WHEN f > 0.0::DOUBLE
+                         THEN -0.5::DOUBLE * (ln(2.0::DOUBLE * pi()) + ln(f) + v * v / f)
+                         ELSE NULL END AS ll_acc
     FROM (
-        SELECT kf.probe_id, kf.t + 1 AS t, kf.ll_acc,
-               _sarimax_kf_step(kf.a, kf.p, s.tmat, s.rqr, o.yd, s.k) AS upd
-        FROM _sarimax_kf kf
-        JOIN query_table(sys_tbl) s ON s.probe_id = kf.probe_id
-        JOIN query_table(obs_tbl) o ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
-    ) q
+        SELECT probe_id, t, ll_acc, k, v, f, ta, tpz,
+               _sarimax_madd(psub, rqr) AS prqr
+        FROM (
+            SELECT probe_id, t, ll_acc, k, rqr, v, f, ta, tpz,
+                   _sarimax_msub(tpt, outerm) AS psub
+            FROM (
+                SELECT probe_id, t, ll_acc, k, rqr, v, f, ta, tpz,
+                       _sarimax_mmul(tp, tmat_t, k, k, k) AS tpt,
+                       list_transform(range(1, k * k + 1), lambda idx:
+                           tpz[(idx - 1) // k + 1] * tpz[(idx - 1) % k + 1] / f) AS outerm
+                FROM (
+                    SELECT probe_id, t, ll_acc, k, tmat_t, rqr, v, f, tp,
+                           list_transform(range(1, k + 1), lambda i: tp[(i - 1) * k + 1]) AS tpz,
+                           ta
+                    FROM (
+                        SELECT kf.probe_id, kf.t + 1 AS t, kf.ll_acc,
+                               s.k AS k, s.tmat_t, s.rqr,
+                               o.yd - kf.a[1] AS v,
+                               kf.p[1] AS f,
+                               _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k) AS tp,
+                               _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1) AS ta
+                        FROM _sarimax_kf kf
+                        JOIN query_table(sys_tbl) s ON s.probe_id = kf.probe_id
+                        JOIN query_table(obs_tbl) o ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
+                    )
+                )
+            )
+        )
+    )
 )
 SELECT probe_id, t, v, f, ll_acc
 FROM _sarimax_kf
 WHERE t >= 1;
 
--- Final state per probe (a_{n+1}, P_{n+1}) -- needed by forecasting.
+-- Final state per probe (a_{n+1}, P_{n+1}) plus the loglikelihood -- the
+-- compact variant used by estimation and forecasting (USING KEY on probe_id:
+-- each iteration replaces the row, so only the final state is retained).
 CREATE OR REPLACE MACRO _sarimax_kfilter_state(obs_tbl, sys_tbl) AS TABLE
 WITH RECURSIVE _sarimax_kfs USING KEY (probe_id) AS (
     SELECT s.probe_id,
@@ -179,15 +175,42 @@ WITH RECURSIVE _sarimax_kfs USING KEY (probe_id) AS (
            0.0::DOUBLE AS ll_acc
     FROM query_table(sys_tbl) s
     UNION ALL
-    SELECT q.probe_id, q.t, (q.upd).anew AS a, (q.upd).pnew AS p,
-           q.ll_acc + (q.upd).term AS ll_acc
+    SELECT probe_id, t,
+           list_transform(range(1, k + 1), lambda i: ta[i] + tpz[i] * v / f) AS a,
+           _sarimax_msym(prqr, k) AS p,
+           ll_acc + CASE WHEN f > 0.0::DOUBLE
+                         THEN -0.5::DOUBLE * (ln(2.0::DOUBLE * pi()) + ln(f) + v * v / f)
+                         ELSE NULL END AS ll_acc
     FROM (
-        SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.ll_acc,
-               _sarimax_kf_step(kfs.a, kfs.p, s.tmat, s.rqr, o.yd, s.k) AS upd
-        FROM _sarimax_kfs kfs
-        JOIN query_table(sys_tbl) s ON s.probe_id = kfs.probe_id
-        JOIN query_table(obs_tbl) o ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
-    ) q
+        SELECT probe_id, t, ll_acc, k, v, f, ta, tpz,
+               _sarimax_madd(psub, rqr) AS prqr
+        FROM (
+            SELECT probe_id, t, ll_acc, k, rqr, v, f, ta, tpz,
+                   _sarimax_msub(tpt, outerm) AS psub
+            FROM (
+                SELECT probe_id, t, ll_acc, k, rqr, v, f, ta, tpz,
+                       _sarimax_mmul(tp, tmat_t, k, k, k) AS tpt,
+                       list_transform(range(1, k * k + 1), lambda idx:
+                           tpz[(idx - 1) // k + 1] * tpz[(idx - 1) % k + 1] / f) AS outerm
+                FROM (
+                    SELECT probe_id, t, ll_acc, k, tmat_t, rqr, v, f, tp,
+                           list_transform(range(1, k + 1), lambda i: tp[(i - 1) * k + 1]) AS tpz,
+                           ta
+                    FROM (
+                        SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.ll_acc,
+                               s.k AS k, s.tmat_t, s.rqr,
+                               o.yd - kfs.a[1] AS v,
+                               kfs.p[1] AS f,
+                               _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k) AS tp,
+                               _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1) AS ta
+                        FROM _sarimax_kfs kfs
+                        JOIN query_table(sys_tbl) s ON s.probe_id = kfs.probe_id
+                        JOIN query_table(obs_tbl) o ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
+                    )
+                )
+            )
+        )
+    )
 )
 SELECT probe_id, t AS n_eff, a, p, ll_acc AS loglik
 FROM _sarimax_kfs;
