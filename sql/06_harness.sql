@@ -511,8 +511,7 @@ _sarimax_f_chk AS MATERIALIZED (
                  ELSE true
                END
            AND CASE
-                 WHEN out_of_core AND
-                      (SELECT count(*) FILTER (WHERE x IS NULL) > 0
+                 WHEN (SELECT count(*) FILTER (WHERE x IS NULL) > 0
                        FROM _sarimax_f_exog)
                    THEN error('sarimax: exog contains NULL values')
                  ELSE true
@@ -527,7 +526,7 @@ _sarimax_f_chk AS MATERIALIZED (
 -- model-scale series: differenced up front when simple_differencing (the
 -- NULL-tolerant staged variant: bit-identical to v1 on complete data, NULL y
 -- propagates), the RAW series otherwise. Literal WHERE gates constant-fold.
-_sarimax_f_y AS MATERIALIZED (
+_sarimax_f_y_unchecked AS MATERIALIZED (
     SELECT t, w AS y
     FROM _sarimax_diff_nt('_sarimax_f_series', 't', 'y', d, sd, s),
          _sarimax_f_chk
@@ -546,6 +545,28 @@ _sarimax_f_exd AS MATERIALIZED (
     SELECT t, j, x
     FROM _sarimax_f_exog, _sarimax_f_chk
     WHERE NOT simple_differencing AND ok
+),
+-- Identification is checked on differenced regressors even when integration
+-- is represented in the state vector.  Keep this validation relational for
+-- the out-of-core path as well.
+_sarimax_f_rank_exog AS MATERIALIZED (
+    SELECT t, j, x
+    FROM _sarimax_diff_exog('_sarimax_f_exog', d, sd, s)
+),
+_sarimax_f_model_chk AS MATERIALIZED (
+    SELECT CASE
+             WHEN (SELECT count(y) FROM _sarimax_f_y_unchecked
+                   WHERE t > CASE WHEN simple_differencing THEN 0
+                                  ELSE _sarimax_kdiff(d, sd, s) END) = 0
+               THEN error('sarimax: model-scale series has no usable observations after burn-in')
+             ELSE true
+           END
+           AND (SELECT coalesce(bool_and(ok), true)
+                FROM _sarimax_rank_check('_sarimax_f_rank_exog')) AS ok
+),
+_sarimax_f_y AS MATERIALIZED (
+    SELECT t, y FROM _sarimax_f_y_unchecked, _sarimax_f_model_chk
+    WHERE ok
 ),
 _sarimax_f_degs AS (
     SELECT unnest(range(1, len(_sarimax_trend_degrees(trend)) + 1))::BIGINT AS idx,

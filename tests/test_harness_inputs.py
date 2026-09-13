@@ -69,3 +69,48 @@ def test_dynamic_differencing_matches_staged_missingness(con, d, sd, s):
     assert [t for t,w in outputs[0] if w is None] == [t for t,w in outputs[1] if w is None]
     np.testing.assert_allclose([w for t,w in outputs[0] if w is not None],
                                [w for t,w in outputs[1] if w is not None], atol=1e-12)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("simple_differencing", [False, True])
+def test_fit_rejects_null_training_exog(con, out_of_core, simple_differencing):
+    con.execute("CREATE OR REPLACE TABLE bad_exog AS SELECT t, "
+                "CASE WHEN t=15 THEN NULL ELSE sin(.4*t) END AS x, "
+                "2*sin(.4*t)+cos(1.7*t) AS y FROM range(1,41) q(t)")
+    with pytest.raises(duckdb.Error, match="exog.*NULL"):
+        con.execute("SELECT * FROM sarimax_fit('bad_exog','y',0,0,0,"
+                    "exog_cols := ['x'],t_col := 't',compute_bse := false,"
+                    f"out_of_core := {out_of_core},"
+                    f"simple_differencing := {simple_differencing})").fetchall()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("simple_differencing", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+def test_fit_rejects_no_usable_observations(con, out_of_core,
+                                           simple_differencing, concentrate):
+    # Differencing poisons every row; without simple differencing the only
+    # observed row is inside the diffuse burn-in period.
+    y = "CASE WHEN t%2=0 THEN NULL ELSE sin(t) END" if simple_differencing else "CASE WHEN t=1 THEN 1.0 ELSE NULL END"
+    con.execute(f"CREATE OR REPLACE TABLE no_obs AS SELECT t,{y} AS y "
+                "FROM range(1,21) q(t)")
+    with pytest.raises(duckdb.Error, match="no usable observations"):
+        con.execute("SELECT * FROM sarimax_fit('no_obs','y',0,1,0,"
+                    "t_col := 't',compute_bse := false,"
+                    f"out_of_core := {out_of_core},concentrate := {concentrate},"
+                    f"simple_differencing := {simple_differencing})").fetchall()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("simple_differencing", [False, True])
+@pytest.mark.parametrize("d,exog", [(1, "['constant']"), (0, "['x','duplicate']")])
+def test_fit_rejects_unidentified_exog(con, out_of_core,
+                                      simple_differencing, d, exog):
+    con.execute("CREATE OR REPLACE TABLE singular_exog AS SELECT t,sin(t) AS y,"
+                "1.0 AS constant,sin(.4*t) AS x,2*sin(.4*t) AS duplicate "
+                "FROM range(1,41) q(t)")
+    with pytest.raises(duckdb.Error, match="identically zero|rank-deficient"):
+        con.execute(f"SELECT * FROM sarimax_fit('singular_exog','y',0,{d},0,"
+                    f"exog_cols := {exog},t_col := 't',compute_bse := false,"
+                    f"out_of_core := {out_of_core},"
+                    f"simple_differencing := {simple_differencing})").fetchall()
