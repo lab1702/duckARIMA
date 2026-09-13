@@ -1117,6 +1117,41 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params_v2(c, rtot, p, q, bigp, bigq
             ELSE [sqrt(c[rtot + p + q + bigp + bigq + 1])] END
 );
 
+-- Transition matrices are sparse even when the integrated state is large.
+-- Cache each row's nonzero columns once; keep their original ascending order
+-- so finite products are accumulated in the same order as the dense kernel.
+CREATE OR REPLACE MACRO _sarimax_transition_rows(tm, k) AS (
+    CASE WHEN len(list_filter(tm, lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
+         THEN NULL
+    ELSE list_transform(range(1, k + 1), lambda zi:
+        list_filter(range(1, k + 1), lambda zj: tm[(zi - 1) * k + zj] <> 0e0)) END
+);
+
+CREATE OR REPLACE MACRO _sarimax_transition_left(tm, nz, b, k, n) AS (
+    CASE WHEN k < 20 OR nz IS NULL OR len(list_filter(b,
+             lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
+         THEN _sarimax_mmul(tm, b, k, k, n)
+    ELSE list_transform(range(1, k * n + 1), lambda zi:
+        list_reduce(list_prepend(0e0,
+            list_transform(nz[(zi - 1) // n + 1], lambda zj:
+                tm[((zi - 1) // n) * k + zj] * b[(zj - 1) * n + (zi - 1) % n + 1])),
+            lambda za, zb: za + zb)) END
+);
+
+-- a * transpose(tm), using the same cached rows of tm. Bind the dense
+-- fallback transpose once: passing it inline to _mmul repeats it per product.
+CREATE OR REPLACE MACRO _sarimax_transition_right(tm, nz, a, k) AS (
+    CASE WHEN k < 20 OR nz IS NULL OR len(list_filter(a,
+             lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
+         THEN (list_transform([_sarimax_mtrans(tm, k, k)], lambda ztt:
+             _sarimax_mmul(a, ztt, k, k, k)))[1]
+    ELSE list_transform(range(1, k * k + 1), lambda zi:
+        list_reduce(list_prepend(0e0,
+            list_transform(nz[(zi - 1) % k + 1], lambda zj:
+                a[((zi - 1) // k) * k + zj] * tm[((zi - 1) % k) * k + zj])),
+            lambda za, zb: za + zb)) END
+);
+
 -- ---- 3b. scalar loglikelihood kernel -------------------------------------------
 
 -- Loglikelihood + scale at a CONSTRAINED v2 parameter vector. ylist is the
@@ -1165,6 +1200,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
       lambda zl2:
         (list_transform([struct_pack(
             ztt := _sarimax_mtrans(zl2.ztm, zl2.zk, zl2.zk),
+            ztnz := _sarimax_transition_rows(zl2.ztm, zl2.zk),
             zrqr := _sarimax_build_rqr(zl2.zrv, zl1.zsigma2, zl2.zk),
             zrqra := _sarimax_build_rqr(zl2.zrva, zl1.zsigma2, zl1.zka),
             za1u := _sarimax_a1_v2(zl2.zta, zl1.zka, d, sd, s, (zl2.zcl)[1]))],
@@ -1175,6 +1211,13 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                       || list_transform(range(1, 31), lambda zd2:
                            struct_pack(zsm := []::DOUBLE[], zaa := []::DOUBLE[])),
                     lambda zacc, zel:
+                      -- Once the transition power is exactly zero, later
+                      -- doubling terms are exactly zero too (no tolerance).
+                      CASE WHEN len(list_filter(zacc.zaa,
+                                          lambda ze: ze IS DISTINCT FROM 0e0)) = 0
+                           AND len(list_filter(zacc.zsm,
+                               lambda ze: ze IS NULL OR NOT isfinite(ze))) = 0
+                           THEN zacc ELSE
                       (list_transform([_sarimax_mmul(zacc.zaa, zacc.zsm,
                                                      zl1.zka, zl1.zka, zl1.zka)],
                        lambda zas:
@@ -1188,7 +1231,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                                  zaa := _sarimax_mmul(zacc.zaa, zacc.zaa,
                                                       zl1.zka, zl1.zka, zl1.zka))))[1]
                          ))[1]
-                      ))[1]
+                      ))[1] END
                  )).zsm],
             lambda zs30:
            (list_transform([_sarimax_msym(zs30, zl1.zka)],
@@ -1209,11 +1252,10 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                  -- shift conjugation: Var[gamma_1] = T P1 T' + RQR,
                  -- E[gamma_1] = T a1 + c_1 e_cidx (kdiff > 0 only)
                  (list_transform([struct_pack(
-                      ztp1 := _sarimax_mmul(zl2.ztm, zp1b, zl2.zk, zl2.zk, zl2.zk),
-                      zta1 := _sarimax_mmul(zl2.ztm, zl3.za1u, zl2.zk, zl2.zk, 1))],
+                      ztp1 := _sarimax_transition_left(zl2.ztm, zl3.ztnz, zp1b, zl2.zk, zl2.zk),
+                      zta1 := _sarimax_transition_left(zl2.ztm, zl3.ztnz, zl3.za1u, zl2.zk, 1))],
                   lambda zl7:
-                    (list_transform([_sarimax_mmul(zl7.ztp1, zl3.ztt,
-                                                   zl2.zk, zl2.zk, zl2.zk)],
+                    (list_transform([_sarimax_transition_right(zl2.ztm, zl3.ztnz, zl7.ztp1, zl2.zk)],
                      lambda ztp1t:
                        -- msym mirrors _sarimax_systems_v2's p1f exactly (the
                        -- madd result is bound before msym sees it)
@@ -1251,18 +1293,15 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                                   (list_transform([struct_pack(
                                        zv := zel.zydv - (zacc.za2)[1],
                                        zf := (zacc.zp2)[1],
-                                       ztp := _sarimax_mmul(zl2.ztm, zacc.zp2,
-                                                            zl2.zk, zl2.zk, zl2.zk),
-                                       zta2 := _sarimax_mmul(zl2.ztm, zacc.za2,
-                                                             zl2.zk, zl2.zk, 1))],
+                                       ztp := _sarimax_transition_left(zl2.ztm, zl3.ztnz, zacc.zp2, zl2.zk, zl2.zk),
+                                       zta2 := _sarimax_transition_left(zl2.ztm, zl3.ztnz, zacc.za2, zl2.zk, 1))],
                                    lambda zi1:
                                      (list_transform([list_transform(range(1, zl2.zk + 1),
                                                           lambda zi2:
                                                               (zi1.ztp)[(zi2 - 1) * zl2.zk + 1])],
                                       lambda ztpz:
                                         (list_transform([struct_pack(
-                                             ztpt := _sarimax_mmul(zi1.ztp, zl3.ztt,
-                                                                   zl2.zk, zl2.zk, zl2.zk),
+                                             ztpt := _sarimax_transition_right(zl2.ztm, zl3.ztnz, zi1.ztp, zl2.zk),
                                              zoutr := list_transform(
                                                  range(1, zl2.zk * zl2.zk + 1), lambda zi4:
                                                      ztpz[(zi4 - 1) // zl2.zk + 1]
@@ -1361,18 +1400,21 @@ CREATE OR REPLACE MACRO _sarimax_ll_x_v2(xunc, ylist, xmat, degs,
 -- than promising bitwise identity.
 CREATE OR REPLACE MACRO _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
                                              r, p, q, bigp, bigq, s, d, sd,
-                                             ktrend, conc) AS (
+                                             ktrend, conc, enabled := true) AS (
   (WITH _sarimax_lro_pr AS (
-       SELECT 1::BIGINT AS probe_id, cpar AS params
+       -- CASE around a scalar subquery does not prevent DuckDB from running
+       -- it. Gate the probe rows inside the subquery so the unused relational
+       -- filter does no work during ordinary in-memory optimization.
+       SELECT 1::BIGINT AS probe_id, cpar AS params WHERE enabled
    ),
    _sarimax_lro_sys AS (
        SELECT * FROM _sarimax_systems_v2('_sarimax_lro_pr',
            r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
    ),
    -- Indirection CTEs keep query_table() names local to this scalar expansion.
-   _sarimax_lro_y AS (SELECT * FROM query_table(y_tbl)),
-   _sarimax_lro_x AS (SELECT * FROM query_table(exog_tbl)),
-   _sarimax_lro_d AS (SELECT * FROM query_table(degs_tbl)),
+   _sarimax_lro_y AS (SELECT * FROM query_table(y_tbl) WHERE enabled),
+   _sarimax_lro_x AS (SELECT * FROM query_table(exog_tbl) WHERE enabled),
+   _sarimax_lro_d AS (SELECT * FROM query_table(degs_tbl) WHERE enabled),
    _sarimax_lro_obs AS (
        SELECT * FROM _sarimax_obs_adj_v2_ooc('_sarimax_lro_y', '_sarimax_lro_x',
            '_sarimax_lro_pr', r, ktrend, '_sarimax_lro_d')
@@ -1385,16 +1427,16 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
                   THEN loglik ELSE NULL END,
        scale2 := CASE WHEN conc THEN scale2
                       ELSE cpar[ktrend + r + p + q + bigp + bigq + 1] END)
-   FROM _sarimax_lro_ll)
+   FROM _sarimax_lro_ll WHERE enabled)
 );
 
 CREATE OR REPLACE MACRO _sarimax_ll_x_ooc_v2(xunc, y_tbl, exog_tbl, degs_tbl,
                                              r, p, q, bigp, bigq, s, d, sd,
-                                             ktrend, conc) AS (
+                                             ktrend, conc, enabled := true) AS (
   _sarimax_ll_c_ooc_v2(
       _sarimax_transform_params_v2(xunc, ktrend + r, p, q, bigp, bigq, conc),
       y_tbl, exog_tbl, degs_tbl,
-      r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+      r, p, q, bigp, bigq, s, d, sd, ktrend, conc, enabled)
 );
 
 CREATE OR REPLACE MACRO _sarimax_ll_c_eval_v2(cpar, ylist, xmat, degs,
@@ -1403,7 +1445,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_eval_v2(cpar, ylist, xmat, degs,
                                               ktrend, conc, out_of_core) AS (
   CASE WHEN out_of_core
        THEN _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
-                                 r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+                                 r, p, q, bigp, bigq, s, d, sd, ktrend, conc, out_of_core)
        ELSE _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                              r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
   END
@@ -1418,7 +1460,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_x_eval_v2(xunc, ylist, xmat, degs,
                                               ktrend, conc, out_of_core) AS (
   CASE WHEN out_of_core
        THEN _sarimax_ll_x_ooc_v2(xunc, y_tbl, exog_tbl, degs_tbl,
-                                 r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
+                                 r, p, q, bigp, bigq, s, d, sd, ktrend, conc, out_of_core)
        ELSE _sarimax_ll_x_v2(xunc, ylist, xmat, degs,
                              r, p, q, bigp, bigq, s, d, sd, ktrend, conc)
   END
@@ -1907,9 +1949,9 @@ LEFT JOIN _sarimax_sq_pick zp ON true;
 -- anchor a1 is linear in c1 = sum(tau) in exact arithmetic, so
 -- a1 = c1 * avec with avec the unit-c1 anchor direction -- but NOT in
 -- float64: _sarimax_a1_v2 embeds c1 in the RHS of its Gauss-Jordan solve,
--- and fl(c1 * fl(1/x)) != fl(c1/x) in general. avec is still exported (it
--- IS the exact direction, useful diagnostically), but _sarimax_ll_mean_v2
--- re-runs the exact c1-scaled solve per probe (karma^3 once -- negligible)
+-- and fl(c1 * fl(1/x)) != fl(c1/x) in general. The gains pass therefore
+-- does not compute or export an unused unit-c1 direction. _sarimax_ll_mean_v2
+-- runs the exact c1-scaled solve per probe (karma^3 once -- negligible)
 -- so the anchor is bit-identical to the full kernel's.
 --
 -- Lambda discipline: identical to section 3 -- z-prefixed lambda vars; cpar
@@ -1935,7 +1977,6 @@ LEFT JOIN _sarimax_sq_pick zp ON true;
 --   sumlogf DOUBLE    sum of ln F_t over non-missing t > burn (NULL-poisoned
 --                     when a counted F_t <= 0, like the full kernel)
 --   cnt     BIGINT    number of counted steps
---   avec    DOUBLE[]  unit-c1 anchor direction (see ANCHOR NOTE above)
 --   cflag   BOOLEAN   concentrated-scale flag
 --   sig2    DOUBLE    the sigma2 parameter (NULL when concentrated)
 CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
@@ -1969,6 +2010,7 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
       lambda zl2:
         (list_transform([struct_pack(
             ztt := _sarimax_mtrans(zl2.ztm, zl2.zk, zl2.zk),
+            ztnz := _sarimax_transition_rows(zl2.ztm, zl2.zk),
             zrqr := _sarimax_build_rqr(zl2.zrv, zl1.zsigma2, zl2.zk),
             zrqra := _sarimax_build_rqr(zl2.zrva, zl1.zsigma2, zl1.zka))],
          lambda zl3:
@@ -1979,6 +2021,13 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
                       || list_transform(range(1, 31), lambda zd2:
                            struct_pack(zsm := []::DOUBLE[], zaa := []::DOUBLE[])),
                     lambda zacc, zel:
+                      -- Once the transition power is exactly zero, later
+                      -- doubling terms are exactly zero too (no tolerance).
+                      CASE WHEN len(list_filter(zacc.zaa,
+                                          lambda ze: ze IS DISTINCT FROM 0e0)) = 0
+                           AND len(list_filter(zacc.zsm,
+                               lambda ze: ze IS NULL OR NOT isfinite(ze))) = 0
+                           THEN zacc ELSE
                       (list_transform([_sarimax_mmul(zacc.zaa, zacc.zsm,
                                                      zl1.zka, zl1.zka, zl1.zka)],
                        lambda zas:
@@ -1992,7 +2041,7 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
                                  zaa := _sarimax_mmul(zacc.zaa, zacc.zaa,
                                                       zl1.zka, zl1.zka, zl1.zka))))[1]
                          ))[1]
-                      ))[1]
+                      ))[1] END
                  )).zsm],
             lambda zs30:
            (list_transform([_sarimax_msym(zs30, zl1.zka)],
@@ -2012,26 +2061,16 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
                lambda zp1b:
                  -- shift conjugation of the covariance: Var[gamma_1] =
                  -- T P1 T' + RQR (kdiff > 0), staged exactly as the kernel
-                 (list_transform([_sarimax_mmul(zl2.ztm, zp1b, zl2.zk, zl2.zk, zl2.zk)],
+                 (list_transform([_sarimax_transition_left(zl2.ztm, zl3.ztnz, zp1b, zl2.zk, zl2.zk)],
                   lambda ztp1:
-                    (list_transform([_sarimax_mmul(ztp1, zl3.ztt,
-                                                   zl2.zk, zl2.zk, zl2.zk)],
+                    (list_transform([_sarimax_transition_right(zl2.ztm, zl3.ztnz, ztp1, zl2.zk)],
                      lambda ztp1t:
                        (list_transform([struct_pack(
                             zp1 := CASE WHEN zl1.zkd = 0 THEN zp1b
                                         ELSE (list_transform([_sarimax_madd(ztp1t, zl3.zrqr)],
                                                   lambda zpm: _sarimax_msym(zpm, zl2.zk)))[1]
-                                   END,
-                            zw := _sarimax_a1_v2(zl2.zta, zl1.zka, d, sd, s, 1e0))],
+                                   END)],
                         lambda zl8:
-                          (list_transform([_sarimax_mmul(zl2.ztm, zl8.zw,
-                                                         zl2.zk, zl2.zk, 1)],
-                           lambda ztw:
-                             (list_transform([CASE WHEN zl1.zkd = 0 THEN zl8.zw
-                                  ELSE list_transform(range(1, zl2.zk + 1), lambda zi5:
-                                           ztw[zi5] + CASE WHEN zi5 = zl1.zkd + 1
-                                                           THEN 1e0 ELSE 0e0 END) END],
-                              lambda zavec:
                                 -- covariance fold in strict t order; F_t and
                                 -- tpz_t are recorded EVERY step; sumlogf/cnt
                                 -- use the data-determined missing mask
@@ -2048,16 +2087,14 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
                                    lambda zacc, zel:
                                      (list_transform([struct_pack(
                                           zf := (zacc.zp2)[1],
-                                          ztp := _sarimax_mmul(zl2.ztm, zacc.zp2,
-                                                               zl2.zk, zl2.zk, zl2.zk))],
+                                          ztp := _sarimax_transition_left(zl2.ztm, zl3.ztnz, zacc.zp2, zl2.zk, zl2.zk))],
                                       lambda zi1:
                                         (list_transform([list_transform(range(1, zl2.zk + 1),
                                                              lambda zi2:
                                                                  (zi1.ztp)[(zi2 - 1) * zl2.zk + 1])],
                                          lambda ztpz:
                                            (list_transform([struct_pack(
-                                                ztpt := _sarimax_mmul(zi1.ztp, zl3.ztt,
-                                                                      zl2.zk, zl2.zk, zl2.zk),
+                                                ztpt := _sarimax_transition_right(zl2.ztm, zl3.ztnz, zi1.ztp, zl2.zk),
                                                 zoutr := list_transform(
                                                     range(1, zl2.zk * zl2.zk + 1), lambda zi4:
                                                         ztpz[(zi4 - 1) // zl2.zk + 1]
@@ -2107,11 +2144,8 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
                                      kmat := zfr.zkm,
                                      sumlogf := zfr.zslf,
                                      cnt := zfr.zcnt::BIGINT,
-                                     avec := zavec,
                                      cflag := conc,
                                      sig2 := zl1.zsig2p)))[1]
-                             ))[1]
-                          ))[1]
                        ))[1]
                     ))[1]
                  ))[1]
@@ -2138,6 +2172,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
    lambda zb0:
      (list_transform([struct_pack(
           zk := (zb0.zg).k,
+          ztnz := _sarimax_transition_rows((zb0.zg).tmat, (zb0.zg).k),
           zkd := (zb0.zg).kdiff,
           zka := (zb0.zg).karma,
           zn := len(zb0.zyd),
@@ -2148,7 +2183,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
         (list_transform([_sarimax_a1_v2((zb0.zg).tarma, zl1.zka,
                                         zl1.zkd, 0, 1, zl1.zc1)],
          lambda za1u:
-           (list_transform([_sarimax_mmul((zb0.zg).tmat, za1u, zl1.zk, zl1.zk, 1)],
+           (list_transform([_sarimax_transition_left((zb0.zg).tmat, zl1.ztnz, za1u, zl1.zk, 1)],
             lambda zta1:
               (list_transform([struct_pack(
                    za1 := CASE WHEN zl1.zkd = 0 THEN za1u
@@ -2174,8 +2209,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
                        (list_transform([struct_pack(
                             zv := zel.zydv - (zacc.za2)[1],
                             zf := ((zb0.zg).fs)[zel.zti],
-                            zta2 := _sarimax_mmul((zb0.zg).tmat, zacc.za2,
-                                                  zl1.zk, zl1.zk, 1))],
+                            zta2 := _sarimax_transition_left((zb0.zg).tmat, zl1.ztnz, zacc.za2, zl1.zk, 1))],
                         lambda zi1:
                           struct_pack(
                             za2 := list_transform(range(1, zl1.zk + 1), lambda zi3:

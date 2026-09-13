@@ -266,7 +266,7 @@ SELECT zs.t, zc.j::INT AS j, _sarimax_exog_x(zs.zd, exog_cols, y_col, zc.j) AS x
 FROM (
     SELECT row_number() OVER (
                ORDER BY CASE WHEN t_col IS NULL THEN NULL
-                             ELSE struct_extract(zd, coalesce(t_col, y_col)) END) AS t,
+                             ELSE struct_extract(zd, coalesce(t_col, exog_cols[1], y_col)) END) AS t,
            zd
     FROM query_table(data) zd
 ) zs
@@ -303,17 +303,23 @@ WITH _sarimax_dd_args AS (
     SELECT d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs
 ),
 _sarimax_dd_list AS (
-    SELECT za.zd + za.zsd * za.zs AS zoff,
+    SELECT za.zd, za.zsd, za.zs, za.zd + za.zsd * za.zs AS zoff,
            _sarimax_diff_poly(za.zd, za.zsd, greatest(za.zs, 1)) AS zc,
            (SELECT list(struct_extract(zrow, ycol)::DOUBLE
                         ORDER BY struct_extract(zrow, tcol)) FROM query_table(tbl) zrow) AS zy
     FROM _sarimax_dd_args za
 )
 SELECT zu.zt AS t,
-       list_reduce(
+       -- Match staged differencing's NULL propagation even when two paths
+       -- cancel algebraically (for example d=2, D=1, s=2 at lag 2).
+       CASE WHEN list_contains(flatten(list_transform(range(0, zl.zd + 1), lambda zi:
+           list_transform(range(0, zl.zsd + 1), lambda zj:
+               zl.zy[zu.zt + zl.zoff - zi - zj * zl.zs] IS NULL))), true)
+       THEN NULL ELSE list_reduce(
            list_prepend(0e0, list_transform(range(1, len(zl.zc) + 1), lambda zi:
-               zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)])),
-           lambda zacc, zx: zacc + zx) AS w
+               CASE WHEN zl.zc[zi] = 0e0 THEN 0e0
+                    ELSE zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)] END)),
+           lambda zacc, zx: zacc + zx) END AS w
 FROM _sarimax_dd_list zl,
      LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
 
@@ -333,7 +339,8 @@ _sarimax_de_lists AS (
 SELECT zu.zt AS t, zl.j,
        list_reduce(
            list_prepend(0e0, list_transform(range(1, len(zl.zc) + 1), lambda zi:
-               zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)])),
+               CASE WHEN zl.zc[zi] = 0e0 THEN 0e0
+                    ELSE zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)] END)),
            lambda zacc, zx: zacc + zx) AS x
 FROM _sarimax_de_lists zl,
      LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
@@ -724,7 +731,8 @@ CREATE OR REPLACE MACRO _sarimax_m_meta(model, which) AS (
     (SELECT value FROM query_table(model) WHERE kind = 'meta' AND name = which)
 );
 CREATE OR REPLACE MACRO _sarimax_m_params(model) AS (
-    (SELECT list(value ORDER BY idx) FROM query_table(model) WHERE kind = 'param')
+    (SELECT coalesce(list(value ORDER BY idx), []::DOUBLE[])
+     FROM query_table(model) WHERE kind = 'param')
 );
 CREATE OR REPLACE MACRO _sarimax_m_bse(model) AS (
     (SELECT list(value ORDER BY idx) FROM query_table(model) WHERE kind = 'bse')
@@ -987,6 +995,18 @@ _sarimax_fc_exd AS MATERIALIZED (
         (SELECT sd_eff FROM _sarimax_fc_dims),
         (SELECT s FROM _sarimax_fc_dims)) zz
 ),
+-- Check every required future cell before the zero-base intercept aggregation.
+-- The check also runs for an empty future table, where exd has no rows.
+_sarimax_fc_excheck AS MATERIALIZED (
+    SELECT CASE
+        WHEN count(*) <> (h)::BIGINT * (SELECT r FROM _sarimax_fc_dims)
+        THEN error('sarimax: future exog coverage is incomplete; require horizons 1..' || (h)::VARCHAR)
+        WHEN count(*) FILTER (WHERE x IS NULL) > 0
+        THEN error('sarimax: NULL future exog values are not allowed')
+        ELSE true END AS ok
+    FROM _sarimax_fc_exd
+    WHERE t BETWEEN 1 AND (h)::BIGINT
+),
 -- trend state intercepts for the horizon window, bound as columns FIRST (the
 -- degs/tau expressions must not reach _sarimax_trend_c's lambdas as raw
 -- subqueries). ct[zh] = the intercept consumed FORMING the state used at
@@ -1018,8 +1038,9 @@ _sarimax_fc_dfut AS MATERIALIZED (
     SELECT probe_id, zh AS h, sum(zdv) AS d, sum(zct) AS ct
     FROM (
         SELECT zp.probe_id, zu.zh AS zh, 0e0 AS zdv, zc.ctl[zu.zh] AS zct
-        FROM _sarimax_fc_probe zp, _sarimax_fc_ct zc,
+        FROM _sarimax_fc_probe zp, _sarimax_fc_ct zc, _sarimax_fc_excheck zcheck,
              LATERAL unnest(range(1, (h)::BIGINT + 1)) AS zu(zh)
+        WHERE zcheck.ok
         UNION ALL
         SELECT zp.probe_id, zed.t AS zh,
                list_reduce(
