@@ -238,11 +238,14 @@ FROM _sarimax_kfilter_state(obs_tbl, sys_tbl);
 -- THE SHIFTED-BASIS TRICK (why this filter can keep Z = e_1): the augmented
 -- design Z is NOT e_1 (it has ones on every ordinary-diff state, on the last
 -- state of each seasonal cycle block, and on the first ARMA state). But when
--- kdiff >= 1, row 1 of the augmented T equals Z exactly, R[1] = 0, and the
+-- kdiff >= 1 and either d > 0 or sd <= 2, row 1 of augmented T equals Z,
+-- R[1] = 0, and the
 -- state intercept never enters row 1 -- so alpha_{t+1}[1] = Z alpha_t
 -- deterministically. Filtering the SHIFTED state beta_t := alpha_{t+1} makes
 -- the observation y_t = beta_t[1] (+ obs intercept), i.e. Z~ = e_1', with the
--- SAME T, R and RQR. The price is a shifted anchor and intercept timing:
+-- SAME T, R and RQR. For d = 0, sd >= 3, use the invertible observation
+-- coordinates below instead (no time shift, cidx = 1).
+-- The time-shifted path uses the following anchor and intercept timing:
 --    anchor:  a~_1 = T a_1 + c_1 e_cidx,  P~_1 = msym(T P_1 T' + RQR)
 --    step t adds c_{t+1} (not c_t) to row cidx; c_{n+1} is outside the obs
 --    table and is applied as 0 -- the FINAL state returned by
@@ -321,6 +324,49 @@ CREATE OR REPLACE MACRO _sarimax_a1_v2(tmat_arma, karma, d, sd, s, c1) AS (
     END
 );
 
+
+-- For d=0, sd>=3, T's first row is not Z, so a one-step time shift
+-- cannot turn the design into e_1. Instead use the invertible coordinates
+-- gamma = B alpha: gamma_1 = Z alpha, gamma_{kdiff+1} = alpha_1,
+-- with all other coordinates unchanged. The trend enters only gamma_1.
+CREATE OR REPLACE MACRO _sarimax_obs_basis(k, kd, s, inverse := false) AS (
+    list_transform(range(1, k*k+1), lambda ix:
+      (list_transform([struct_pack(i := (ix-1)//k+1, j := (ix-1)%k+1)], lambda rc:
+        CASE WHEN NOT inverse THEN
+          CASE WHEN rc.i=1 THEN
+                 CASE WHEN (rc.j<=kd AND rc.j%s=0) OR rc.j=kd+1 THEN 1e0 ELSE 0e0 END
+               WHEN rc.i=kd+1 THEN CASE WHEN rc.j=1 THEN 1e0 ELSE 0e0 END
+               ELSE CASE WHEN rc.i=rc.j THEN 1e0 ELSE 0e0 END END
+        ELSE
+          CASE WHEN rc.i=1 THEN CASE WHEN rc.j=kd+1 THEN 1e0 ELSE 0e0 END
+               WHEN rc.i=kd+1 THEN
+                 CASE WHEN rc.j=1 THEN 1e0
+                      WHEN (rc.j>1 AND rc.j<=kd AND rc.j%s=0)
+                           OR (rc.j=kd+1 AND s=1) THEN -1e0 ELSE 0e0 END
+               ELSE CASE WHEN rc.i=rc.j THEN 1e0 ELSE 0e0 END END
+        END))[1])
+);
+
+-- Bind products before composition to avoid repeated matrix evaluation.
+CREATE OR REPLACE MACRO _sarimax_basis_vector(v, k, d, sd, s) AS (
+    CASE WHEN d=0 AND sd>=3 THEN
+      (list_transform([_sarimax_obs_basis(k, sd*s, s)], lambda basis:
+         _sarimax_mmul(basis, v, k, k, 1)))[1]
+    ELSE v END
+);
+CREATE OR REPLACE MACRO _sarimax_basis_matrix(m, k, d, sd, s, transition := false) AS (
+    CASE WHEN d=0 AND sd>=3 THEN
+      (list_transform([_sarimax_obs_basis(k, sd*s, s)], lambda basis:
+        (list_transform([_sarimax_mmul(basis, m, k, k, k)], lambda bm:
+          (list_transform([CASE WHEN transition THEN _sarimax_obs_basis(k, sd*s, s, inverse := true)
+                               ELSE _sarimax_mtrans(basis, k, k) END], lambda right_basis:
+            _sarimax_mmul(bm, right_basis, k, k, k)))[1]))[1]))[1]
+    ELSE m END
+);
+CREATE OR REPLACE MACRO _sarimax_filter_cidx(d, sd, s) AS (
+    CASE WHEN d=0 AND sd>=3 THEN 1::BIGINT ELSE (d+sd*s+1)::BIGINT END
+);
+
 -- ---- v2 system construction per probe ----------------------------------------
 
 -- probes_tbl: (probe_id BIGINT, params DOUBLE[]) in v2 canonical order
@@ -328,7 +374,10 @@ CREATE OR REPLACE MACRO _sarimax_a1_v2(tmat_arma, karma, d, sd, s, c1) AS (
 -- Returns one row per probe:
 --   (probe_id, k, karma, kdiff, cidx, burn, tmat, tmat_t, rqr, p1, a1,
 --    a1f, p1f)
--- where (p1, a1) are the RAW statsmodels initializations (fixture 'P1'/'a1')
+-- tmat/tmat_t/rqr and a1f/p1f are in filter coordinates. cidx = 1 denotes
+-- unshifted timing for constructed systems; time_shift records this explicitly.
+-- Legacy caller-supplied systems without time_shift retain kdiff-based timing.
+-- The (p1, a1) outputs retain the RAW statsmodels initializations (fixture 'P1'/'a1')
 -- and (p1f, a1f) are the shifted-basis filter anchors described above --
 -- _sarimax_kfilter_v2 consumes a1f/p1f. Probes sharing the arma+sigma2 slice
 -- share one heavy construction (poly expansion + Lyapunov + anchor cov);
@@ -401,7 +450,7 @@ _sarimax_sv2_pf3 AS (
 _sarimax_sv2_sys AS (
     SELECT zr, zkt, armav, karma, kdiff, k, tmat, tmat_arma, tmat_t, rqr, p1,
            zd, zsd, zs,
-           CASE WHEN kdiff = 0 THEN p1
+           CASE WHEN kdiff = 0 OR (zd=0 AND zsd>=3) THEN p1
                 ELSE _sarimax_msym(tp1tr, k) END AS p1f
     FROM _sarimax_sv2_pf3
 ),
@@ -423,13 +472,18 @@ _sarimax_sv2_a1 AS (
 _sarimax_sv2_ta1 AS (
     SELECT *, _sarimax_mmul(tmat, a1, k, k, 1) AS ta1 FROM _sarimax_sv2_a1
 )
-SELECT probe_id, k, karma, kdiff, (kdiff + 1)::BIGINT AS cidx,
-       kdiff::BIGINT AS burn, tmat, tmat_t, rqr, p1, a1,
-       CASE WHEN kdiff = 0 THEN a1
+SELECT probe_id, k, karma, kdiff, _sarimax_filter_cidx(zd, zsd, zs) AS cidx,
+       kdiff > 0 AND NOT (zd = 0 AND zsd >= 3) AS time_shift,
+       kdiff::BIGINT AS burn,
+       _sarimax_basis_matrix(tmat, k, zd, zsd, zs, transition := true) AS tmat,
+       _sarimax_mtrans(_sarimax_basis_matrix(tmat, k, zd, zsd, zs, transition := true), k, k) AS tmat_t,
+       _sarimax_basis_matrix(rqr, k, zd, zsd, zs) AS rqr, p1, a1,
+       CASE WHEN zd=0 AND zsd>=3 THEN _sarimax_basis_vector(a1, k, zd, zsd, zs)
+            WHEN kdiff = 0 THEN a1
             ELSE list_transform(range(1, k + 1), lambda zi:
                      ta1[zi] + CASE WHEN zi = kdiff + 1 THEN c1
                                     ELSE 0e0 END) END AS a1f,
-       p1f
+       _sarimax_basis_matrix(p1f, k, zd, zsd, zs) AS p1f
 FROM _sarimax_sv2_ta1;
 
 -- ---- v2 observation prep -------------------------------------------------------
@@ -527,14 +581,17 @@ LEFT JOIN _sarimax_oa2o_int di
 --   P' = msym((v NULL ? T P T' : T P T' - (TP e_1)(TP e_1)'/f) + RQR)
 --   counted (v not NULL and t > burn): cnt += 1, sumlogf += ln f (NULL when
 --   f <= 0, poisoning the accumulator), ssq += v^2/f.
--- The intercept c applied at step t is ct at row t + 1 when kdiff > 0 (the
--- shifted-basis timing; 0 beyond the sample) and ct at row t when kdiff = 0.
+-- The intercept c applied at step t is ct at row t + 1 when time_shift is true (the
+-- shifted-basis timing; 0 beyond the sample) and ct at row t otherwise.
 CREATE OR REPLACE MACRO _sarimax_kfilter_impl_v2(obs_tbl, sys_tbl, use_sparse, use_shift := false) AS TABLE
 WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     -- Cache transition support once per system, outside the time recursion.
     SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
            ELSE NULL::BIGINT[][] END AS tnz
-    FROM query_table(sys_tbl)
+    FROM (
+        SELECT * FROM query_table(sys_tbl)
+        UNION ALL BY NAME SELECT NULL::BOOLEAN AS time_shift WHERE false
+    )
 ), _sarimax_step_obs AS MATERIALIZED (
     -- The intercept for each step is invariant across the recursion. Keep
     -- the time-key join relational so DuckDB can spill this intermediate.
@@ -543,7 +600,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     JOIN _sarimax_sparse_sys s ON s.probe_id = o.probe_id
     LEFT JOIN query_table(obs_tbl) oc
       ON oc.probe_id = o.probe_id
-     AND oc.t = o.t + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
+     AND oc.t = o.t + CASE WHEN coalesce(s.time_shift, s.kdiff > 0) THEN 1 ELSE 0 END
 ), _sarimax_kf2 USING KEY (probe_id, t) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,
@@ -642,13 +699,16 @@ SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_shift_input', true, us
 -- avoid a system join at every step; storage stays per probe, not per timestep.
 -- Same arithmetic as _sarimax_kfilter_v2. Returns
 -- (probe_id, n_eff, a, p, cnt, sumlogf, ssq); note the shifted-basis caveat
--- above about the missing c_{n+1} term in the final a when kdiff > 0.
+-- above about the missing c_{n+1} term in the final a when cidx > 1.
 CREATE OR REPLACE MACRO _sarimax_kfilter_state_impl_v2(obs_tbl, sys_tbl, use_sparse, use_shift := false) AS TABLE
 WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     -- Cache transition support once per system, outside the time recursion.
     SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
            ELSE NULL::BIGINT[][] END AS tnz
-    FROM query_table(sys_tbl)
+    FROM (
+        SELECT * FROM query_table(sys_tbl)
+        UNION ALL BY NAME SELECT NULL::BOOLEAN AS time_shift WHERE false
+    )
 ), _sarimax_step_obs AS MATERIALIZED (
     -- The intercept for each step is invariant across the recursion. Keep
     -- the time-key join relational so DuckDB can spill this intermediate.
@@ -657,7 +717,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     JOIN _sarimax_sparse_sys s ON s.probe_id = o.probe_id
     LEFT JOIN query_table(obs_tbl) oc
       ON oc.probe_id = o.probe_id
-     AND oc.t = o.t + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
+     AND oc.t = o.t + CASE WHEN coalesce(s.time_shift, s.kdiff > 0) THEN 1 ELSE 0 END
 ), _sarimax_kfs2 USING KEY (probe_id) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,

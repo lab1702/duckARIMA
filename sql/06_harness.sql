@@ -941,7 +941,7 @@ SELECT _sarimax_m_meta(model, 'loglik') AS loglik,
 --     stored or needed) and future exog enter RAW (identity differencing).
 -- Trend models add the state intercept inside _sarimax_fc_diff_v2 (ct
 -- timing pinned there; the trend_c window starts at n_eff when the engine
--- ran unshifted, n_eff + 1 in the shifted kdiff > 0 basis). Concentrated
+-- ran unshifted, n_eff + 1 in the time-shifted basis). Concentrated
 -- models: the stored state P is at unit scale, so both variance columns are
 -- multiplied by meta sigma2 before se / lo / hi.
 CREATE OR REPLACE MACRO sarimax_forecast(model, data, y_col, h,
@@ -1041,7 +1041,7 @@ _sarimax_fc_excheck AS MATERIALIZED (
 -- degs/tau expressions must not reach _sarimax_trend_c's lambdas as raw
 -- subqueries). ct[zh] = the intercept consumed FORMING the state used at
 -- horizon zh: c at model-time n_eff + zh - 1 in the unshifted (kdiff = 0)
--- filter basis, n_eff + zh in the shifted one (kdiff = d_eng + s*sd_eng > 0,
+-- filter basis, n_eff + zh in the time-shifted one (cidx > 1,
 -- where the stored state excludes its pending intercept) -- see
 -- _sarimax_fc_diff_v2's header.
 _sarimax_fc_targs AS (
@@ -1049,7 +1049,7 @@ _sarimax_fc_targs AS (
            (SELECT coalesce(list(value::BIGINT ORDER BY idx), []::BIGINT[])
             FROM query_table(model) WHERE kind = 'trend') AS degs,
            list_slice(zp.params, 1, zd.ktrend) AS tau,
-           zd.n_eff + CASE WHEN zd.d_eng + zd.s * zd.sd_eng > 0
+           zd.n_eff + CASE WHEN _sarimax_filter_cidx(zd.d_eng, zd.sd_eng, zd.s) > 1
                            THEN 1 ELSE 0 END AS tstart
     FROM _sarimax_fc_dims zd, _sarimax_fc_probe zp
 ),

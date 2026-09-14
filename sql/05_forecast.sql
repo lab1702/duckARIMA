@@ -465,12 +465,12 @@ ORDER BY 1, 2;
 -- dfut.ct at row h is the state intercept CONSUMED FORMING the state used
 -- for mean_h. The alignment to model time depends on the filter basis
 -- (sql/03_filter.sql section 2, "the shifted-basis trick"):
---   kdiff = 0  (unshifted): the h = 1 state is a_{n+1}, whose intercept
+--   cidx = 1  (unshifted): the h = 1 state is a_{n+1}, whose intercept
 --     c_{n_model} the filter already applied -- row 1's ct is never read,
 --     and advancing h -> h+1 adds row (h+1)'s ct = c_{n_model+h}. Callers
 --     fill ct[h] = c at model-time n_model + h - 1, i.e.
 --     _sarimax_trend_c(degs, tau, n_model, H)[h].
---   kdiff > 0  (shifted basis): the stored filter state EXCLUDES its own
+--   cidx > 1  (shifted basis): the stored filter state EXCLUDES its own
 --     pending intercept c_{n_model+1} (applied as 0 past the sample end), so
 --     THIS macro adds row 1's ct to the base state at cidx before the
 --     recursion; the state used for mean_h consumed c at model-time
@@ -483,6 +483,10 @@ ORDER BY 1, 2;
 -- ----------------------------------------------------------------------------
 CREATE OR REPLACE MACRO _sarimax_fc_diff_v2(state_tbl, sys_tbl, dfut_tbl, hmax) AS TABLE
 WITH RECURSIVE
+_sarimax_fcd2_sys AS MATERIALIZED (
+    SELECT * FROM query_table(sys_tbl)
+    UNION ALL BY NAME SELECT NULL::BOOLEAN AS time_shift WHERE false
+),
 _sarimax_fcd2_chk AS (
     SELECT CASE WHEN (hmax) < 1
                 THEN error('_sarimax_fc_diff_v2: H must be >= 1, got ' || (hmax))
@@ -511,11 +515,11 @@ _sarimax_fcd2 AS (
            df.d + st.a[1] AS mean_diff,
            st.p[1] AS var_diff,
            [st.p[1]]::DOUBLE[] AS omega,
-           -- shifted basis (kdiff > 0): restore the pending intercept the
+           -- shifted basis (cidx > 1): restore the pending intercept the
            -- filter left out of the stored state (cidx > 1 there, so
            -- mean_diff at h = 1 is unaffected)
            list_transform(range(1, sy.k + 1), lambda zi:
-               st.a[zi] + CASE WHEN sy.kdiff > 0 AND zi = sy.cidx
+               st.a[zi] + CASE WHEN coalesce(sy.time_shift, sy.kdiff > 0) AND zi = sy.cidx
                                THEN df.ct ELSE 0e0 END) AS a,
            st.p AS p,
            list_transform(range(1, sy.k + 1), lambda zi:
@@ -523,7 +527,7 @@ _sarimax_fcd2 AS (
            list_transform(range(1, sy.k + 1), lambda zi:
                st.p[(zi - 1) * sy.k + 1]) AS pzflat
     FROM query_table(state_tbl) st
-    JOIN query_table(sys_tbl) sy ON sy.probe_id = st.probe_id
+    JOIN _sarimax_fcd2_sys sy ON sy.probe_id = st.probe_id
     JOIN _sarimax_fcd2_df df ON df.probe_id = st.probe_id AND df.h = 1
     CROSS JOIN _sarimax_fcd2_chk ck
     WHERE ck.ok
@@ -581,7 +585,7 @@ _sarimax_fcd2 AS (
                        fc.gflat AS gflat,
                        fc.pzflat AS pzflat
                 FROM _sarimax_fcd2 fc
-                JOIN query_table(sys_tbl) sy ON sy.probe_id = fc.probe_id
+                JOIN _sarimax_fcd2_sys sy ON sy.probe_id = fc.probe_id
                 JOIN _sarimax_fcd2_df df
                        ON df.probe_id = fc.probe_id AND df.h = fc.h + 1
                 WHERE fc.h < (hmax)
