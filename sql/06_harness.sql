@@ -561,6 +561,23 @@ _sarimax_f_rank_design AS MATERIALIZED (
     FROM _sarimax_f_rank_exog
     WHERE trend IN ('c', 'ct')
 ),
+-- Missing targets contribute no direct regression information. Check the
+-- observed model-scale design too: raw rows for state-space integration,
+-- differenced rows (including differencing-induced NULLs) otherwise.
+_sarimax_f_observed_exog AS MATERIALIZED (
+    SELECT xe.t, xe.j, xe.x
+    FROM _sarimax_f_exd xe
+    JOIN _sarimax_f_y_unchecked yy USING (t)
+    WHERE yy.y IS NOT NULL
+),
+_sarimax_f_observed_design AS MATERIALIZED (
+    SELECT t, j, x FROM _sarimax_f_observed_exog
+    UNION ALL
+    SELECT DISTINCT t, (len(exog_cols) + 1)::INT AS j, 1e0 AS x
+    FROM _sarimax_f_observed_exog
+    WHERE trend IN ('c', 'ct')
+      AND (simple_differencing OR _sarimax_kdiff(d, sd, s) = 0)
+),
 _sarimax_f_model_chk AS MATERIALIZED (
     SELECT CASE
              WHEN (SELECT count(y) FROM _sarimax_f_y_unchecked
@@ -570,7 +587,9 @@ _sarimax_f_model_chk AS MATERIALIZED (
              ELSE true
            END
            AND (SELECT coalesce(bool_and(ok), true)
-                FROM _sarimax_rank_check('_sarimax_f_rank_design')) AS ok
+                FROM _sarimax_rank_check('_sarimax_f_rank_design'))
+           AND (SELECT coalesce(bool_and(ok), true)
+                FROM _sarimax_rank_check('_sarimax_f_observed_design')) AS ok
 ),
 _sarimax_f_y AS MATERIALIZED (
     SELECT t, y FROM _sarimax_f_y_unchecked, _sarimax_f_model_chk
