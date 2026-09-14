@@ -1,4 +1,4 @@
-"""Reproducible EXPLAIN ANALYZE profiles of the relational Kalman filter.
+"""Reproducible EXPLAIN ANALYZE profiles of Kalman filters and likelihoods.
 
 Run with the test environment: python tools/profile_filter.py --output scratch/profile
 Use --macros to compare an earlier assembled library, holding inputs/settings fixed.
@@ -27,7 +27,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--macros', type=Path, default=ROOT / 'sarimax_macros.sql')
     parser.add_argument('--output', type=Path, default=ROOT / 'scratch/profile')
-    parser.add_argument('--mode', choices=['state', 'trace', 'likelihood'], default='state')
+    parser.add_argument('--mode', choices=['state', 'trace', 'likelihood', 'scalar'], default='state')
     parser.add_argument('--cases', nargs='+', choices=CASES, default=['k2', 'k14', 'k27'])
     parser.add_argument('--params', type=float, nargs=3, default=[0.3, 0.2, 1.0],
                         metavar=('COEF1', 'COEF2', 'VARIANCE'))
@@ -51,12 +51,17 @@ def main():
     c.execute('CREATE VIEW y AS SELECT t, yd AS y FROM obs')
     c.execute('CREATE TABLE x(t BIGINT, j BIGINT, x DOUBLE)')
     c.execute('CREATE TABLE degrees(idx BIGINT, degree BIGINT)')
+    if args.mode == 'scalar':
+        c.execute('CREATE TABLE packed AS SELECT list(yd ORDER BY t) AS yl FROM obs')
     summary = {'duckdb': duckdb.__version__, 'mode': args.mode, 'rows': args.rows,
                'threads': args.threads, 'params': args.params, 'cases': {}}
     for name in args.cases:
         orders = CASES[name]
         c.execute(f"CREATE OR REPLACE TABLE sys AS SELECT * FROM _sarimax_systems_v2('probes', {orders})")
-        if args.mode == 'likelihood':
+        if args.mode == 'scalar':
+            query = (f'SELECT _sarimax_ll_c_v2({params_sql}, yl, '
+                     f'[]::DOUBLE[][], []::BIGINT[], {orders}) FROM packed')
+        elif args.mode == 'likelihood':
             query = (f"SELECT _sarimax_ll_c_ooc_v2({params_sql}, "
                      f"'y', 'x', 'degrees', {orders})")
         elif args.mode == 'trace':

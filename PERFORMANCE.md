@@ -302,3 +302,44 @@ Validation: 80 targeted tests passed, including the 20 MB relational likelihood
 regression, mixed state dimensions and transition types, time gaps and empty
 probes, v2 fixtures, live statsmodels checks, and generated assembly. No fixtures,
 public result columns, or numerical tolerances changed.
+
+## Investigation: observation join and scalar initialization gates
+
+This pass against `579bd07` found no runtime change worth retaining. All runtime
+experiments were reverted; only scalar profiling support and these notes were
+kept. Measurements used DuckDB 1.5.5, one thread, 500 observations, and five
+measured executions after a warmup.
+
+An ASOF observation lookup followed by an exact-time filter was substantially
+slower for seasonal systems. It preserved benchmark results, but did not improve
+the recursive lookup plan:
+
+| State dimension | Existing equality join | ASOF candidate |
+|---|---:|---:|
+| 2 | 280 ms | 288 ms |
+| 14 | 324 ms | 525 ms |
+| 27 | 477 ms | 1,223 ms |
+
+The scalar engine was also profiled independently. Explicit constant gates for
+zero exogenous regressors and zero trend terms allowed bypassing adjustment,
+trend construction, and initial-mean solving in the SQL expression. They did
+not show a convincing speedup over the existing engine. Two unchanged-baseline
+runs produced 513–518 ms, 985–1,063 ms, and 775–780 ms for k2/k14/k27; the gated
+candidate produced 525/1,035/800 ms. Its benchmark results matched exactly, but
+the added branches were not retained.
+
+The profiling tool now accepts `--mode scalar`:
+
+```bash
+python tools/profile_filter.py --mode scalar --rows 500 --repeats 5 --output scratch/scalar-profile
+```
+
+It materializes the ordered observation list before preparing the query, then
+profiles `_sarimax_ll_c_v2` against that bound column. Packing and macro loading
+are excluded from the reported timings. This is a single-probe kernel benchmark;
+the optimizer evaluates batches of probes, so these measurements do not justify
+changing the default fit engine or claiming an end-to-end fit speedup.
+
+Both candidate comparisons preserved all three benchmark results. The three
+assembly tests passed after reverting the runtime experiments. The shipped SQL
+and SQL development sources are unchanged from `579bd07`.
