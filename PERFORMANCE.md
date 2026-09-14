@@ -72,3 +72,54 @@ python tools/profile_filter.py --output scratch/after --repeats 7
 Run these sequentially with no competing test/benchmark process. Compare the
 `*-result.json` files as well as timings. No machine-specific timing assertion
 is added to the correctness suite.
+
+## Follow-up: compute intercept lookups before recursion
+
+A second pass against commit `e48ca4a` moves the invariant intercept lookup
+out of each recursive step. The original filter joined observations twice per
+step: once for the target and once for the current or next timestep's trend
+intercept. Both v2 filters now materialize `(probe_id, t, yd, ct)` with a single
+relational time-key join before starting their recursion. The intermediate can
+spill; it is not an input-sized LIST. This trades additional relational storage
+for fewer repeated scans and hash joins.
+
+DuckDB 1.5.5, one thread, **500 observations**, five measured executions after
+one warmup (same deterministic inputs as above):
+
+| State dimension | Previous main | Precomputed intercepts | Speedup |
+|---|---:|---:|---:|
+| 2 | 548 ms | 317 ms | 1.73× |
+| 14 | 800 ms | 466 ms | 1.72× |
+| 27 | 875 ms | 513 ms | 1.70× |
+
+These are additional gains over the sparse transition optimization, measured
+at a different observation count from the first table. All final-state values
+matched the baseline exactly. The recursive LEFT hash join disappears from the
+new plan; the intercept join now executes outside the time recursion. Remaining
+observation access inside the recursion can still scale poorly with long
+series, so this is not a claim of linear overall runtime.
+
+The profiling tool also accepts `--mode trace` for the full trace and
+`--mode likelihood` for the relational likelihood including system construction
+and observation adjustment. Each mode emits plans and result files for exact
+baseline comparisons; timings include fetching the selected result. The default
+`--mode state` continues to exclude system construction. For example:
+
+```bash
+python tools/profile_filter.py --mode likelihood --rows 500 --repeats 5 --output scratch/likelihood
+```
+
+The full relational likelihood comparison at the same 500 rows and five
+repetitions includes initialization, which limits the overall gain:
+
+| State dimension | Previous main | Precomputed intercepts | Time reduction |
+|---|---:|---:|---:|
+| 2 | 518 ms | 317 ms | 39% |
+| 14 | 2,667 ms | 2,376 ms | 11% |
+| 27 | 2,867 ms | 2,449 ms | 15% |
+
+Every likelihood result matched exactly. Validation: 64 existing targeted tests
+passed, including v2 fixtures, live statsmodels comparisons, mixed dense/sparse
+systems, assembly, and the 20 MB relational likelihood regression; one added
+regression also passed for shifted/unshifted intercepts, missing targets, a gap
+in time keys, and a probe with no observations. No golden fixtures changed.

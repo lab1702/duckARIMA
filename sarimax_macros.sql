@@ -2203,6 +2203,15 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
            ELSE NULL::BIGINT[][] END AS tnz
     FROM query_table(sys_tbl)
+), _sarimax_step_obs AS MATERIALIZED (
+    -- The intercept for each step is invariant across the recursion. Keep
+    -- the time-key join relational so DuckDB can spill this intermediate.
+    SELECT o.probe_id, o.t, o.yd, coalesce(oc.ct, 0e0) AS ct
+    FROM query_table(obs_tbl) o
+    JOIN _sarimax_sparse_sys s ON s.probe_id = o.probe_id
+    LEFT JOIN query_table(obs_tbl) oc
+      ON oc.probe_id = o.probe_id
+     AND oc.t = o.t + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
 ), _sarimax_kf2 USING KEY (probe_id, t) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,
@@ -2255,7 +2264,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                         SELECT kf.probe_id, kf.t + 1 AS t, kf.cnt, kf.sumlogf,
                                kf.ssq, s.k AS k, s.cidx, s.burn, s.tmat, s.tmat_t, s.tnz,
                                s.rqr,
-                               coalesce(oc.ct, 0e0) AS ct,
+                               o.ct AS ct,
                                o.yd - kf.a[1] AS v,
                                kf.p[1] AS f,
                                CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k)
@@ -2265,12 +2274,8 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                         FROM _sarimax_kf2 kf
                         JOIN _sarimax_sparse_sys s
                           ON s.probe_id = kf.probe_id
-                        JOIN query_table(obs_tbl) o
+                        JOIN _sarimax_step_obs o
                           ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
-                        LEFT JOIN query_table(obs_tbl) oc
-                          ON oc.probe_id = kf.probe_id
-                         AND oc.t = kf.t + 1
-                                   + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
                     )
                 )
             )
@@ -2303,6 +2308,15 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
            ELSE NULL::BIGINT[][] END AS tnz
     FROM query_table(sys_tbl)
+), _sarimax_step_obs AS MATERIALIZED (
+    -- The intercept for each step is invariant across the recursion. Keep
+    -- the time-key join relational so DuckDB can spill this intermediate.
+    SELECT o.probe_id, o.t, o.yd, coalesce(oc.ct, 0e0) AS ct
+    FROM query_table(obs_tbl) o
+    JOIN _sarimax_sparse_sys s ON s.probe_id = o.probe_id
+    LEFT JOIN query_table(obs_tbl) oc
+      ON oc.probe_id = o.probe_id
+     AND oc.t = o.t + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
 ), _sarimax_kfs2 USING KEY (probe_id) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,
@@ -2352,7 +2366,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                         SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.cnt,
                                kfs.sumlogf, kfs.ssq, s.k AS k, s.cidx, s.burn,
                                s.tmat, s.tmat_t, s.tnz, s.rqr,
-                               coalesce(oc.ct, 0e0) AS ct,
+                               o.ct AS ct,
                                o.yd - kfs.a[1] AS v,
                                kfs.p[1] AS f,
                                CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k)
@@ -2362,12 +2376,8 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                         FROM _sarimax_kfs2 kfs
                         JOIN _sarimax_sparse_sys s
                           ON s.probe_id = kfs.probe_id
-                        JOIN query_table(obs_tbl) o
+                        JOIN _sarimax_step_obs o
                           ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
-                        LEFT JOIN query_table(obs_tbl) oc
-                          ON oc.probe_id = kfs.probe_id
-                         AND oc.t = kfs.t + 1
-                                   + CASE WHEN s.kdiff > 0 THEN 1 ELSE 0 END
                     )
                 )
             )

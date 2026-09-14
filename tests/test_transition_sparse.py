@@ -89,3 +89,37 @@ def test_relational_dispatch_matches_dense_for_mixed_systems(con, threads):
             assert actual == expected
     finally:
         con.execute(f'SET threads = {previous_threads}')
+
+
+def test_precomputed_intercepts_preserve_time_gaps_and_empty_probes(con):
+    """Shifted intercepts use t+1, never the next available row after a gap."""
+    con.execute("""
+        CREATE OR REPLACE TABLE intercept_sys AS
+        SELECT id AS probe_id, 1 AS k, CASE WHEN id = 2 THEN 1 ELSE 0 END AS kdiff,
+               1 AS cidx, 0 AS burn, [1e0] AS tmat, [1e0] AS tmat_t,
+               [1e0] AS rqr, [0e0] AS a1f, [1e0] AS p1f
+        FROM range(1, 4) r(id)
+    """)
+    con.execute("""
+        CREATE OR REPLACE TABLE intercept_obs AS
+        SELECT id AS probe_id, t, yd, ct
+        FROM range(1, 3) r(id) CROSS JOIN
+             (VALUES (1::BIGINT, 2e0, 10e0), (2, NULL, 20e0),
+                     (4, 100e0, 99e0)) v(t, yd, ct)
+    """)
+    states = con.execute("""
+        SELECT * FROM _sarimax_kfilter_state_v2('intercept_obs','intercept_sys')
+        ORDER BY probe_id
+    """).fetchall()
+    assert states == [
+        (1, 2, [32.0], [2.0], 1, 0.0, 4.0),
+        (2, 2, [22.0], [2.0], 1, 0.0, 4.0),
+        (3, 0, [0.0], [1.0], 0, 0.0, 0.0),
+    ]
+    trace = con.execute("""
+        SELECT probe_id, t, v, f FROM
+            _sarimax_kfilter_v2('intercept_obs','intercept_sys')
+        ORDER BY probe_id, t
+    """).fetchall()
+    assert trace == [(1, 1, 2.0, 1.0), (1, 2, None, 1.0),
+                     (2, 1, 2.0, 1.0), (2, 2, None, 1.0)]

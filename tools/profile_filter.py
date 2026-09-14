@@ -18,6 +18,7 @@ def main():
     parser = argparse.ArgumentParser(description=__doc__)
     parser.add_argument('--macros', type=Path, default=ROOT / 'sarimax_macros.sql')
     parser.add_argument('--output', type=Path, default=ROOT / 'scratch/profile')
+    parser.add_argument('--mode', choices=['state', 'trace', 'likelihood'], default='state')
     parser.add_argument('--rows', type=int, default=150)
     parser.add_argument('--repeats', type=int, default=3)
     parser.add_argument('--threads', type=int, default=1)
@@ -32,13 +33,22 @@ def main():
     c.execute('CREATE TABLE obs AS SELECT 1 AS probe_id, i AS t, '
               'CASE WHEN i % 19 = 0 THEN NULL ELSE sin(i::DOUBLE) END AS yd, '
               '0e0 AS ct FROM range(1, ?) r(i)', [args.rows + 1])
-    summary = {'duckdb': duckdb.__version__, 'rows': args.rows,
+    c.execute('CREATE VIEW y AS SELECT t, yd AS y FROM obs')
+    c.execute('CREATE TABLE x(t BIGINT, j BIGINT, x DOUBLE)')
+    c.execute('CREATE TABLE degrees(idx BIGINT, degree BIGINT)')
+    summary = {'duckdb': duckdb.__version__, 'mode': args.mode, 'rows': args.rows,
                'threads': args.threads, 'cases': {}}
     for name, orders in [('k2', '0,1,1,0,0,1,0,0,0,false'),
                          ('k14', '0,0,1,0,1,12,0,0,0,false'),
                          ('k27', '0,0,1,0,1,12,1,1,0,false')]:
         c.execute(f"CREATE OR REPLACE TABLE sys AS SELECT * FROM _sarimax_systems_v2('probes', {orders})")
-        query = "SELECT * FROM _sarimax_kfilter_state_v2('obs', 'sys')"
+        if args.mode == 'likelihood':
+            query = ("SELECT _sarimax_ll_c_ooc_v2([0.3,0.2,1.0]::DOUBLE[], "
+                     f"'y', 'x', 'degrees', {orders})")
+        elif args.mode == 'trace':
+            query = "SELECT * FROM _sarimax_kfilter_v2('obs', 'sys') ORDER BY probe_id, t"
+        else:
+            query = "SELECT * FROM _sarimax_kfilter_state_v2('obs', 'sys')"
         start = time.perf_counter()
         c.execute('PREPARE filter_query AS ' + query)
         prepare_s = time.perf_counter() - start
@@ -57,6 +67,7 @@ def main():
                 operators.append({'operator': node['operator_name'],
                                   'seconds': node['operator_timing'],
                                   'rows': node['operator_cardinality'],
+                                  'rows_scanned': node.get('operator_rows_scanned', 0),
                                   'detail': node.get('extra_info', {})})
             for child in node.get('children', []):
                 walk(child)
