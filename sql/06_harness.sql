@@ -211,12 +211,17 @@ SELECT t, y,
 FROM _sarimax_sco_ordered;
 
 -- (t, y) with t = 1..n by t_col order (or natural order when t_col is NULL).
+-- Keep the natural scan separate: sorting on an all-NULL key can reorder ties.
 CREATE OR REPLACE MACRO _sarimax_series_of(data, y_col, t_col) AS TABLE
+SELECT row_number() OVER () AS t, struct_extract(zd, y_col)::DOUBLE AS y
+FROM query_table(data) zd
+WHERE t_col IS NULL
+UNION ALL
 SELECT row_number() OVER (
-           ORDER BY CASE WHEN t_col IS NULL THEN NULL
-                         ELSE struct_extract(zd, coalesce(t_col, y_col)) END) AS t,
+           ORDER BY struct_extract(zd, coalesce(t_col, y_col))) AS t,
        struct_extract(zd, y_col)::DOUBLE AS y
-FROM query_table(data) zd;
+FROM query_table(data) zd
+WHERE t_col IS NOT NULL;
 
 -- Long-form exog (t, j, x) from named columns; zero rows when the list is
 -- empty. struct_extract keys must be constants, so the column dispatch is a
@@ -264,11 +269,15 @@ CREATE OR REPLACE MACRO _sarimax_exog_x(zd, exog_cols, y_col, zj) AS (
 CREATE OR REPLACE MACRO _sarimax_exog_of(data, exog_cols, y_col, t_col) AS TABLE
 SELECT zs.t, zc.j::INT AS j, _sarimax_exog_x(zs.zd, exog_cols, y_col, zc.j) AS x
 FROM (
+    SELECT row_number() OVER () AS t, zd
+    FROM query_table(data) zd
+    WHERE t_col IS NULL
+    UNION ALL
     SELECT row_number() OVER (
-               ORDER BY CASE WHEN t_col IS NULL THEN NULL
-                             ELSE struct_extract(zd, coalesce(t_col, exog_cols[1], y_col)) END) AS t,
+               ORDER BY struct_extract(zd, coalesce(t_col, exog_cols[1], y_col))) AS t,
            zd
     FROM query_table(data) zd
+    WHERE t_col IS NOT NULL
 ) zs
 CROSS JOIN (
     SELECT unnest(range(1, len(exog_cols) + 1)) AS j

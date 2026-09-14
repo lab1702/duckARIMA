@@ -98,8 +98,12 @@ behavior", recorded here so nothing is implicit in code:
    `simple_differencing := false`, else 0. NOTE: missing observations do
    NOT reduce n_eff (statsmodels' convention).
 9. **Optimizer** (BFGS, Armijo backtracking, central-difference gradients) —
-   constants pinned in the spec §5.4. `converged` in `meta` reports the
-   gradient criterion; `restarted = 1` flags the one perturbed restart.
+   constants pinned in the spec §5.4. `converged` in `meta` reports either
+   the gradient criterion or a numerical-stall termination rule. For models
+   with integration inside the state vector, a second exhausted line search
+   after the restart can set this flag even when `grad_norm` remains large;
+   inspect `grad_norm` alongside the flag. `restarted = 1` flags the one
+   perturbed restart.
 10. **Seasonal argument names**: `sp/sd/sq` stand in for P/D/Q because DuckDB
     macro parameters are case-insensitive.
 11. **Re-supplying `exog_cols`**: the forecast/diagnostics macros take the

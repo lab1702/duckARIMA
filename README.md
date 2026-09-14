@@ -36,7 +36,8 @@ SELECT * FROM sarimax_summary('m', 'sales', 'units');          -- coefficients, 
 SELECT * FROM sarimax_forecast('m', 'sales', 'units', 12,
                                newdata := 'future_regressors',
                                exog_cols := ['promo', 'price']); -- h, yhat, se, lo, hi
-SELECT * FROM sarimax_evaluate('m', 'sales', 'units');          -- loglik, AIC, BIC, sigma2
+SELECT * FROM sarimax_evaluate('m', 'sales', 'units',
+                               exog_cols := ['promo', 'price']); -- loglik, AIC, BIC, sigma2
 ```
 
 Beyond the basics, `sarimax_fit` supports trend terms (`trend := 'c' | 't' |
