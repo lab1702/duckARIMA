@@ -3826,12 +3826,12 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                              (list_transform([(list_reduce(
                                 [struct_pack(za2 := zl10.za1, zp2 := zl10.zp1,
                                              zcnt := 0e0, zslf := 0e0, zssq := 0e0,
-                                             zydv := 0e0, zct := 0e0, zti := 0::BIGINT)]
+                                             zydv := 0e0, zct := 0e0, zti := 0::BIGINT, zvalid := true)]
                                   || list_transform(range(1, zl1.zn + 1), lambda zt:
                                        struct_pack(za2 := []::DOUBLE[], zp2 := []::DOUBLE[],
                                                    zcnt := 0e0, zslf := 0e0, zssq := 0e0,
                                                    zydv := (zl2.zyd)[zt],
-                                                   zct := (zl10.zcs)[zt], zti := zt)),
+                                                   zct := (zl10.zcs)[zt], zti := zt, zvalid := true)),
                                 lambda zacc, zel:
                                   (list_transform([struct_pack(
                                        zv := zel.zydv - (zacc.za2)[1],
@@ -3852,7 +3852,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                                          lambda zb1:
                                            (list_transform([_sarimax_msub(zb1.ztpt, zb1.zoutr)],
                                             lambda zmsb:
-                                              (list_transform([CASE WHEN zi1.zv IS NULL
+                                              (list_transform([CASE WHEN zel.zydv IS NULL
                                                                     THEN zb1.ztpt
                                                                     ELSE zmsb END],
                                                lambda zpre:
@@ -3862,28 +3862,32 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                                                       za2 := list_transform(
                                                           range(1, zl2.zk + 1), lambda zi3:
                                                               (zi1.zta2)[zi3]
-                                                              + (CASE WHEN zi1.zv IS NULL THEN 0e0
+                                                              + (CASE WHEN zel.zydv IS NULL THEN 0e0
                                                                       ELSE ztpz[zi3] * zi1.zv / zi1.zf END)
                                                               + (CASE WHEN zi3 = _sarimax_filter_cidx(d, sd, s)
                                                                       THEN zel.zct ELSE 0e0 END)),
                                                       zp2 := _sarimax_msym(zpu, zl2.zk),
                                                       zcnt := zacc.zcnt
-                                                          + CASE WHEN zi1.zv IS NOT NULL
+                                                          + CASE WHEN zel.zydv IS NOT NULL
                                                                       AND zel.zti > zl1.zkd
                                                                  THEN 1e0 ELSE 0e0 END,
                                                       zslf := zacc.zslf
-                                                          + CASE WHEN zi1.zv IS NULL
+                                                          + CASE WHEN zel.zydv IS NULL
                                                                       OR zel.zti <= zl1.zkd
                                                                  THEN 0e0
                                                                  WHEN zi1.zf > 0e0 THEN ln(zi1.zf)
                                                                  ELSE NULL END,
                                                       zssq := zacc.zssq
-                                                          + CASE WHEN zi1.zv IS NULL
+                                                          + CASE WHEN zel.zydv IS NULL
                                                                       OR zel.zti <= zl1.zkd
                                                                  THEN 0e0
                                                                  ELSE zi1.zv * zi1.zv / zi1.zf END,
                                                       zydv := 0e0, zct := 0e0,
-                                                      zti := 0::BIGINT)))[1]
+                                                      zti := 0::BIGINT,
+                                                      -- Validity is independent of burn-in and input missingness.
+                                                      zvalid := zacc.zvalid AND coalesce(
+                                                          isfinite(zi1.zf) AND zi1.zf > 0e0
+                                                          AND (zel.zydv IS NULL OR isfinite(zi1.zv)), false))))[1]
                                               ))[1]
                                            ))[1]
                                         ))[1]
@@ -3902,9 +3906,9 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                                                    + zfr.zslf + zfr.zssq) END],
                                  lambda zllr:
                                    struct_pack(
-                                     ll := CASE WHEN zllr IS NOT NULL AND isfinite(zllr)
+                                     ll := CASE WHEN zfr.zvalid AND zllr IS NOT NULL AND isfinite(zllr)
                                                 THEN zllr ELSE NULL END,
-                                     scale2 := CASE WHEN conc
+                                     scale2 := CASE WHEN NOT zfr.zvalid THEN NULL WHEN conc
                                                     THEN CASE WHEN zfr.zcnt > 0e0
                                                                    AND isfinite(zfr.zssq)
                                                               THEN zfr.zssq / zfr.zcnt
@@ -4752,11 +4756,11 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
                  -- yd, intercept and t ride in zydv/zct/zti)
                  (list_transform([(list_reduce(
                      [struct_pack(za2 := zl10.za1, zcnt := 0e0, zssq := 0e0,
-                                  zydv := 0e0, zct := 0e0, zti := 0::BIGINT)]
+                                  zydv := 0e0, zct := 0e0, zti := 0::BIGINT, zvalid := true)]
                        || list_transform(range(1, zl1.zn + 1), lambda zt:
                             struct_pack(za2 := []::DOUBLE[], zcnt := 0e0, zssq := 0e0,
                                         zydv := (zb0.zyd)[zt],
-                                        zct := (zl10.zcs)[zt], zti := zt)),
+                                        zct := (zl10.zcs)[zt], zti := zt, zvalid := true)),
                      lambda zacc, zel:
                        (list_transform([struct_pack(
                             zv := zel.zydv - (zacc.za2)[1],
@@ -4766,19 +4770,23 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
                           struct_pack(
                             za2 := list_transform(range(1, zl1.zk + 1), lambda zi3:
                                        (zi1.zta2)[zi3]
-                                       + (CASE WHEN zi1.zv IS NULL THEN 0e0
+                                       + (CASE WHEN zel.zydv IS NULL THEN 0e0
                                                ELSE ((zb0.zg).kmat)[(zel.zti - 1) * zl1.zk + zi3]
                                                     * zi1.zv / zi1.zf END)
                                        + (CASE WHEN zi3 = (zb0.zg).cidx
                                                THEN zel.zct ELSE 0e0 END)),
                             zcnt := zacc.zcnt
-                                + CASE WHEN zi1.zv IS NOT NULL AND zel.zti > zl1.zkd
+                                + CASE WHEN zel.zydv IS NOT NULL AND zel.zti > zl1.zkd
                                        THEN 1e0 ELSE 0e0 END,
                             zssq := zacc.zssq
-                                + CASE WHEN zi1.zv IS NULL OR zel.zti <= zl1.zkd
+                                + CASE WHEN zel.zydv IS NULL OR zel.zti <= zl1.zkd
                                        THEN 0e0
                                        ELSE zi1.zv * zi1.zv / zi1.zf END,
-                            zydv := 0e0, zct := 0e0, zti := 0::BIGINT)))[1]
+                            zydv := 0e0, zct := 0e0, zti := 0::BIGINT,
+                            -- Validity is independent of burn-in and input missingness.
+                            zvalid := zacc.zvalid AND coalesce(
+                                isfinite(zi1.zf) AND zi1.zf > 0e0
+                                AND (zel.zydv IS NULL OR isfinite(zi1.zv)), false))))[1]
                   ))],
                   lambda zfr:
                     (list_transform([CASE WHEN (zb0.zg).cflag
@@ -4792,9 +4800,9 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
                                        + (zb0.zg).sumlogf + zfr.zssq) END],
                      lambda zllr:
                        struct_pack(
-                         ll := CASE WHEN zllr IS NOT NULL AND isfinite(zllr)
+                         ll := CASE WHEN zfr.zvalid AND zllr IS NOT NULL AND isfinite(zllr)
                                     THEN zllr ELSE NULL END,
-                         scale2 := CASE WHEN (zb0.zg).cflag
+                         scale2 := CASE WHEN NOT zfr.zvalid THEN NULL WHEN (zb0.zg).cflag
                                         THEN CASE WHEN zfr.zcnt > 0e0
                                                        AND isfinite(zfr.zssq)
                                                   THEN zfr.zssq / zfr.zcnt
