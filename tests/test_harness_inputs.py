@@ -174,3 +174,28 @@ def test_grid_sql_escapes_literal_names(con, time_col):
     assert len(result) == 1
     assert np.isfinite(result[0][7:10]).all()
     assert result[0][10] == 1
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("simple_differencing", [False, True])
+@pytest.mark.parametrize("trend", ['c', 'ct'])
+def test_fit_rejects_constant_exog_with_constant_trend(
+        con, out_of_core, simple_differencing, trend):
+    con.execute("CREATE OR REPLACE TABLE constant_exog AS SELECT t,"
+                "1.0 AS x,3+sin(t) AS y FROM range(1,31) q(t)")
+    with pytest.raises(duckdb.Error, match="rank-deficient"):
+        con.execute("SELECT * FROM sarimax_fit('constant_exog','y',0,0,0,"
+                    "exog_cols := ['x'],t_col := 't',compute_bse := false,"
+                    f"trend := '{trend}',out_of_core := {out_of_core},"
+                    f"simple_differencing := {simple_differencing})").fetchall()
+
+
+@pytest.mark.parametrize("level", ['-0.5', '0', '1', '1.5', 'NULL',
+                                   "'NaN'::DOUBLE", "'Infinity'::DOUBLE"])
+def test_forecast_rejects_invalid_confidence_level(con, level):
+    con.execute("CREATE OR REPLACE TABLE future AS "
+                "SELECT 3.0 AS x FROM range(3)")
+    with pytest.raises(duckdb.Error, match="level must be finite and strictly between 0 and 1"):
+        con.execute("SELECT * FROM sarimax_forecast('model','obs','y',3,"
+                    "newdata := 'future',exog_cols := ['x'],"
+                    f"level := {level})").fetchall()

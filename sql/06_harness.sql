@@ -543,6 +543,15 @@ _sarimax_f_rank_exog AS MATERIALIZED (
     SELECT t, j, x
     FROM _sarimax_diff_exog('_sarimax_f_exog', d, sd, s)
 ),
+-- A constant trend and a constant in the differenced regressor span cannot
+-- be estimated separately. Include that trend in the identification check.
+_sarimax_f_rank_design AS MATERIALIZED (
+    SELECT t, j, x FROM _sarimax_f_rank_exog
+    UNION ALL
+    SELECT DISTINCT t, (len(exog_cols) + 1)::INT AS j, 1e0 AS x
+    FROM _sarimax_f_rank_exog
+    WHERE trend IN ('c', 'ct')
+),
 _sarimax_f_model_chk AS MATERIALIZED (
     SELECT CASE
              WHEN (SELECT count(y) FROM _sarimax_f_y_unchecked
@@ -552,7 +561,7 @@ _sarimax_f_model_chk AS MATERIALIZED (
              ELSE true
            END
            AND (SELECT coalesce(bool_and(ok), true)
-                FROM _sarimax_rank_check('_sarimax_f_rank_exog')) AS ok
+                FROM _sarimax_rank_check('_sarimax_f_rank_design')) AS ok
 ),
 _sarimax_f_y AS MATERIALIZED (
     SELECT t, y FROM _sarimax_f_y_unchecked, _sarimax_f_model_chk
@@ -940,6 +949,10 @@ CREATE OR REPLACE MACRO sarimax_forecast(model, data, y_col, h,
                                          t_col := NULL, level := 0.95) AS TABLE
 WITH _sarimax_fc_chk AS (
     SELECT _sarimax_check_exog_names(model, exog_cols)
+           AND CASE WHEN level IS NULL OR NOT isfinite(level)
+                         OR level <= 0e0 OR level >= 1e0
+                    THEN error('sarimax: level must be finite and strictly between 0 and 1')
+                    ELSE true END
            AND CASE WHEN len(exog_cols) > 0 AND newdata IS NULL
                     THEN error('sarimax: the model has exogenous regressors; supply future values via newdata')
                     ELSE true END AS ok
