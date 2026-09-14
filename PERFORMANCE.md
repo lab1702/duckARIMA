@@ -123,3 +123,49 @@ passed, including v2 fixtures, live statsmodels comparisons, mixed dense/sparse
 systems, assembly, and the 20 MB relational likelihood regression; one added
 regression also passed for shifted/unshifted intercepts, missing targets, a gap
 in time keys, and a probe with no observations. No golden fixtures changed.
+
+## Follow-up: finite covariance initialization for pure MA transitions
+
+Profiling the full likelihood after commit `79fb874` put about 1.85 seconds in
+the initial covariance projection for the 14-state seasonal MA model. The
+previous implementation solved a 196-variable Kronecker system even though its
+transition matrix is a pure shift.
+
+For an exact shift matrix, `T^k = 0`, so the stationary covariance is the finite
+series `Q + T Q T' + ... + T^(k-1) Q (T')^(k-1)`. Each output element is an
+ascending sum along one diagonal of Q. The new path uses O(k³) value work and
+O(k²) output storage instead of constructing the O(k⁴) augmented system and
+performing O(k⁶) dense elimination. Ascending summation matches the old solver's
+pivot-order arithmetic on the validated finite inputs.
+
+The macro checks the matrix entries, not the model's name or a near-zero
+tolerance. General and near-shift transitions retain the original solver,
+now named `_sarimax_lyap_dense`. NULL/nonfinite inputs and shortcut results
+containing overflow or negative zero also retain the dense path. The scalar
+estimation engine's existing doubling initialization is unchanged.
+
+Use `--params COEF1 COEF2 VARIANCE` to vary the profiling inputs. The two
+coefficients mean AR/MA for the k2 case and ordinary/seasonal MA for k14/k27;
+they default to `0.3 0.2 1.0` and are recorded in the summary JSON.
+
+Fresh full-likelihood measurements on DuckDB 1.5.5, one thread, 500 observations,
+five measured executions after one warmup, against `79fb874`:
+
+| State dimension | Previous main | Shift covariance | Speedup |
+|---|---:|---:|---:|
+| 2 (general ARMA) | 317 ms | 323 ms | 0.98× |
+| 14 (seasonal MA) | 2,340 ms | 488 ms | 4.80× |
+| 27 (integrated seasonal MA) | 2,445 ms | 528 ms | 4.63× |
+
+The 2-state difference is ordinary timing variation; its covariance uses the
+general solver. For an additional negative-coefficient check (`--params -0.3
+-0.2 1.0`, 150 observations, three measured executions), k14 improved from
+1,997 ms to 150 ms and k27 from 2,014 ms to 157 ms. The larger relative gain at
+150 rows reflects initialization's fixed cost; these are likelihood-call
+measurements, not full optimizer-fit speedups.
+
+All six baseline/tuned likelihood comparisons were exactly equal. Validation:
+364 targeted tests passed and nine non-applicable exogenous-data checks skipped.
+This includes the new shift-versus-dense covariance comparisons, general-solver
+fixtures, both filter generations, live statsmodels checks, low-memory
+likelihood checks, and assembly. No fixtures or numerical tolerances changed.

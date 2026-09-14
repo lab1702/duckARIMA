@@ -282,7 +282,7 @@ CREATE OR REPLACE MACRO _sarimax_inv_list(a, n) AS (
 -- pass: row r (0-based) = (idx-1)//(k^2+1), col c (1-based) = (idx-1)%(k^2+1)+1;
 -- left block gets I(r+1, c) - kron[r*k^2 + c], right column gets vec(RQR')[r+1].
 -- Validation (residual substitution, spec 6) lives in the acceptance tests.
-CREATE OR REPLACE MACRO _sarimax_lyap(t, r_qr, k) AS (
+CREATE OR REPLACE MACRO _sarimax_lyap_dense(t, r_qr, k) AS (
   (list_transform([
      struct_pack(zkr := _sarimax_mkron(t, t, k, k, k, k),
                  zvr := _sarimax_mvec(r_qr, k, k))
@@ -301,6 +301,35 @@ CREATE OR REPLACE MACRO _sarimax_lyap(t, r_qr, k) AS (
       ], lambda zl2:
         _sarimax_munvec(zl2.x, k, k)))[1]
   ))[1]
+);
+
+
+-- For a pure shift T, T^k = 0 and the Lyapunov series is finite:
+-- P[i,j] = sum_h RQR[i+h,j+h]. Ascending h preserves the dense solver's
+-- pivot-order additions. Reject nonfinite inputs so its propagation semantics
+-- remain those of the general solver.
+CREATE OR REPLACE MACRO _sarimax_lyap(t, r_qr, k) AS (
+    CASE WHEN len(t) = k * k AND len(r_qr) = k * k
+              AND len(list_filter(range(1, k * k + 1), lambda zi:
+                  t[zi] IS DISTINCT FROM
+                      CASE WHEN (zi - 1) % k = (zi - 1) // k + 1
+                           THEN 1e0 ELSE 0e0 END)) = 0
+              AND len(list_filter(r_qr, lambda zv:
+                  zv IS NULL OR NOT isfinite(zv))) = 0
+         THEN (list_transform([
+             list_transform(range(1, k * k + 1), lambda zi:
+                 list_reduce(list_transform(
+                     range(0, k - greatest((zi - 1) // k, (zi - 1) % k)),
+                     lambda zh: r_qr[zi + zh * (k + 1)]),
+                     lambda za, zb: za + zb))
+         ], lambda zp:
+             -- Overflow or signed zero can interact with the dense solver's
+             -- zero multiplications. Preserve that path in those cases.
+             CASE WHEN len(list_filter(zp, lambda zv:
+                           NOT isfinite(zv) OR (zv = 0e0 AND signbit(zv)))) > 0
+                  THEN _sarimax_lyap_dense(t, r_qr, k)
+                  ELSE zp END))[1]
+         ELSE _sarimax_lyap_dense(t, r_qr, k) END
 );
 
 
