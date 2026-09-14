@@ -6861,6 +6861,40 @@ ORDER BY stage, idx;
 
 -- ---- the fit --------------------------------------------------------------------
 
+-- Without AR terms, trend mean paths are known before fitting and do not
+-- depend on MA coefficients. Evolve the original state coordinates with no
+-- measurement updates so initialization and differencing timing stay exact.
+-- The recursion retains only the current state, including out-of-core fits.
+CREATE OR REPLACE MACRO _sarimax_noar_trend_design(y_tbl, trend, d, sd, s, enabled) AS TABLE
+WITH RECURSIVE
+_sarimax_nt_args AS (
+    SELECT _sarimax_kdiff(d, sd, s) + 1 AS k,
+           _sarimax_build_t_v2([]::DOUBLE[], 1, d, sd, s) AS tm,
+           _sarimax_build_z_v2(1, d, sd, s) AS zv,
+           (SELECT count(*) FROM query_table(y_tbl)) AS n
+    WHERE enabled
+),
+_sarimax_nt_degs AS (
+    SELECT unnest(range(1, len(_sarimax_trend_degrees(trend)) + 1)) AS j,
+           unnest(_sarimax_trend_degrees(trend)) AS degree
+    WHERE enabled
+),
+_sarimax_nt_states AS (
+    SELECT dg.j, dg.degree, 1::BIGINT AS t,
+           _sarimax_mzeros(na.k - 1, 1) || [1e0] AS a
+    FROM _sarimax_nt_args na, _sarimax_nt_degs dg WHERE na.n > 0
+    UNION ALL
+    SELECT st.j, st.degree, st.t + 1,
+           list_transform(_sarimax_mmul(na.tm, st.a, na.k, na.k, 1),
+               lambda av, ai: av + CASE WHEN ai = na.k
+                                       THEN pow(st.t::DOUBLE, st.degree::DOUBLE)
+                                       ELSE 0e0 END) AS a
+    FROM _sarimax_nt_states st, _sarimax_nt_args na WHERE st.t < na.n
+)
+SELECT st.t, st.j,
+       list_sum(list_transform(st.a, lambda av, ai: av * na.zv[ai])) AS x
+FROM _sarimax_nt_states st, _sarimax_nt_args na;
+
 CREATE OR REPLACE MACRO sarimax_fit(data, y_col, p, d, q,
                                     sp := 0, sd := 0, sq := 0, s := 1,
                                     exog_cols := []::VARCHAR[], t_col := NULL,
@@ -6963,6 +6997,15 @@ _sarimax_f_observed_design AS MATERIALIZED (
     FROM _sarimax_f_observed_exog
     WHERE trend IN ('c', 'ct')
       AND (simple_differencing OR _sarimax_kdiff(d, sd, s) = 0)
+      AND (p > 0 OR sp > 0)
+    UNION ALL
+    SELECT td.t, (len(exog_cols) + td.j)::INT AS j, td.x
+    FROM _sarimax_noar_trend_design('_sarimax_f_y_unchecked', trend,
+             CASE WHEN simple_differencing THEN 0 ELSE d END,
+             CASE WHEN simple_differencing THEN 0 ELSE sd END,
+             greatest(s, 1), p = 0 AND sp = 0 AND len(exog_cols) > 0) td
+    JOIN _sarimax_f_y_unchecked yy USING (t)
+    WHERE yy.y IS NOT NULL
 ),
 _sarimax_f_model_chk AS MATERIALIZED (
     SELECT CASE
