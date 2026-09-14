@@ -84,7 +84,7 @@ _sarimax_sys_rqr AS (
 ),
 _sarimax_sys_full AS (
     SELECT armav, k, tmat, tmat_t, rqr,
-           _sarimax_lyap(tmat, rqr, k) AS p1
+           _sarimax_lyap_checked(tmat, rqr, k) AS p1
     FROM _sarimax_sys_rqr
 )
 SELECT pr.probe_id, b.k, b.tmat, b.tmat_t, b.rqr, b.p1
@@ -287,7 +287,7 @@ FROM _sarimax_kfilter_state(obs_tbl, sys_tbl);
 -- lyapunov(T_arma, RQR_arma)) with EXACTLY zero cross blocks. tmat_arma and
 -- rqr_arma are the karma-sized v1 blocks (flattened row-major).
 CREATE OR REPLACE MACRO _sarimax_p1_v2(tmat_arma, rqr_arma, karma, d, sd, s) AS (
-    (list_transform([_sarimax_lyap(tmat_arma, rqr_arma, karma)], lambda zlp:
+    (list_transform([_sarimax_lyap_checked(tmat_arma, rqr_arma, karma)], lambda zlp:
         list_transform(
             range(1, (d + s * sd + karma) * (d + s * sd + karma) + 1),
             lambda zidx:
@@ -622,7 +622,9 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
            v, f,
            cnt + CASE WHEN v IS NOT NULL AND t > burn
                       THEN 1::BIGINT ELSE 0::BIGINT END AS cnt,
-           sumlogf + CASE WHEN v IS NOT NULL AND t > burn
+           sumlogf + CASE WHEN NOT coalesce(isfinite(f) AND f > 0e0, false)
+                          THEN NULL
+                          WHEN v IS NOT NULL AND t > burn
                           THEN CASE WHEN f > 0e0 THEN ln(f) ELSE NULL END
                           ELSE 0e0 END AS sumlogf,
            ssq + CASE WHEN v IS NOT NULL AND t > burn
@@ -737,7 +739,9 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
            _sarimax_msym(prqr, k) AS p,
            cnt + CASE WHEN v IS NOT NULL AND t > burn
                       THEN 1::BIGINT ELSE 0::BIGINT END AS cnt,
-           sumlogf + CASE WHEN v IS NOT NULL AND t > burn
+           sumlogf + CASE WHEN NOT coalesce(isfinite(f) AND f > 0e0, false)
+                          THEN NULL
+                          WHEN v IS NOT NULL AND t > burn
                           THEN CASE WHEN f > 0e0 THEN ln(f) ELSE NULL END
                           ELSE 0e0 END AS sumlogf,
            ssq + CASE WHEN v IS NOT NULL AND t > burn
@@ -808,7 +812,8 @@ SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_shift_input', tr
 
 -- Loglikelihood per probe. conc: 0 = sigma2 lives in RQR (standard formula),
 -- 1 = concentrated scale (filter ran at sigma2 = 1; scale2 = ssq/cnt).
--- A NULL-poisoned sumlogf (some counted F_t <= 0) propagates to loglik NULL.
+-- Invalid forecast variance poisons sumlogf even during burn-in or missing data,
+-- and therefore propagates to loglik NULL.
 CREATE OR REPLACE MACRO _sarimax_loglik_v2(obs_tbl, sys_tbl, conc) AS TABLE
 WITH _sarimax_ll2_args AS (
     SELECT conc::BIGINT AS zconc

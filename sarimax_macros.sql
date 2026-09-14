@@ -355,6 +355,39 @@ CREATE OR REPLACE MACRO _sarimax_lyap(t, r_qr, k) AS (
 );
 
 
+-- Stationary initialization must satisfy P = T P T' + Q. The dense
+-- solver can skip singular pivots, so validate its residual before filtering.
+-- Return the unsymmetrized solve to preserve the caller's arithmetic.
+CREATE OR REPLACE MACRO _sarimax_lyap_checked(tmat, rqr, k) AS (
+    (list_transform([struct_pack(tm := tmat, rq := rqr, dim := k)],
+      lambda zdcargs:
+         (list_transform([_sarimax_lyap(zdcargs.tm, zdcargs.rq, zdcargs.dim)],
+               lambda zdcov:
+                 (list_transform([_sarimax_mmul(zdcargs.tm, zdcov,
+                                                zdcargs.dim, zdcargs.dim, zdcargs.dim)],
+                   lambda zdctp:
+                     (list_transform([_sarimax_mtrans(zdcargs.tm, zdcargs.dim, zdcargs.dim)],
+                       lambda zdctt:
+                         (list_transform([_sarimax_mmul(zdctp, zdctt,
+                                                        zdcargs.dim, zdcargs.dim, zdcargs.dim)],
+                           lambda zdctpt:
+                             (list_transform([struct_pack(
+                                 residual := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                     lambda zi: abs(zdcov[zi]-zdctpt[zi]-zdcargs.rq[zi]))),
+                                 scale := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                     lambda zi: abs(zdcov[zi])+abs(zdctpt[zi])+abs(zdcargs.rq[zi])))
+                             )], lambda zdccheck:
+                                 CASE WHEN isfinite(zdccheck.residual) AND isfinite(zdccheck.scale)
+                                           AND zdccheck.residual <= 1e-10 * zdccheck.scale
+                                      THEN zdcov
+                                      ELSE list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                                          lambda zi: NULL::DOUBLE) END))[1]
+                         ))[1]
+                     ))[1]
+                 ))[1]
+             ))[1]))[1]
+);
+
 -- ----------------------------------------------------------------------------
 -- B. Relational encoding (table macros; table names as strings)
 -- ----------------------------------------------------------------------------
@@ -1787,7 +1820,7 @@ _sarimax_sys_rqr AS (
 ),
 _sarimax_sys_full AS (
     SELECT armav, k, tmat, tmat_t, rqr,
-           _sarimax_lyap(tmat, rqr, k) AS p1
+           _sarimax_lyap_checked(tmat, rqr, k) AS p1
     FROM _sarimax_sys_rqr
 )
 SELECT pr.probe_id, b.k, b.tmat, b.tmat_t, b.rqr, b.p1
@@ -1990,7 +2023,7 @@ FROM _sarimax_kfilter_state(obs_tbl, sys_tbl);
 -- lyapunov(T_arma, RQR_arma)) with EXACTLY zero cross blocks. tmat_arma and
 -- rqr_arma are the karma-sized v1 blocks (flattened row-major).
 CREATE OR REPLACE MACRO _sarimax_p1_v2(tmat_arma, rqr_arma, karma, d, sd, s) AS (
-    (list_transform([_sarimax_lyap(tmat_arma, rqr_arma, karma)], lambda zlp:
+    (list_transform([_sarimax_lyap_checked(tmat_arma, rqr_arma, karma)], lambda zlp:
         list_transform(
             range(1, (d + s * sd + karma) * (d + s * sd + karma) + 1),
             lambda zidx:
@@ -2325,7 +2358,9 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
            v, f,
            cnt + CASE WHEN v IS NOT NULL AND t > burn
                       THEN 1::BIGINT ELSE 0::BIGINT END AS cnt,
-           sumlogf + CASE WHEN v IS NOT NULL AND t > burn
+           sumlogf + CASE WHEN NOT coalesce(isfinite(f) AND f > 0e0, false)
+                          THEN NULL
+                          WHEN v IS NOT NULL AND t > burn
                           THEN CASE WHEN f > 0e0 THEN ln(f) ELSE NULL END
                           ELSE 0e0 END AS sumlogf,
            ssq + CASE WHEN v IS NOT NULL AND t > burn
@@ -2440,7 +2475,9 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
            _sarimax_msym(prqr, k) AS p,
            cnt + CASE WHEN v IS NOT NULL AND t > burn
                       THEN 1::BIGINT ELSE 0::BIGINT END AS cnt,
-           sumlogf + CASE WHEN v IS NOT NULL AND t > burn
+           sumlogf + CASE WHEN NOT coalesce(isfinite(f) AND f > 0e0, false)
+                          THEN NULL
+                          WHEN v IS NOT NULL AND t > burn
                           THEN CASE WHEN f > 0e0 THEN ln(f) ELSE NULL END
                           ELSE 0e0 END AS sumlogf,
            ssq + CASE WHEN v IS NOT NULL AND t > burn
@@ -2511,7 +2548,8 @@ SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_shift_input', tr
 
 -- Loglikelihood per probe. conc: 0 = sigma2 lives in RQR (standard formula),
 -- 1 = concentrated scale (filter ran at sigma2 = 1; scale2 = ssq/cnt).
--- A NULL-poisoned sumlogf (some counted F_t <= 0) propagates to loglik NULL.
+-- Invalid forecast variance poisons sumlogf even during burn-in or missing data,
+-- and therefore propagates to loglik NULL.
 CREATE OR REPLACE MACRO _sarimax_loglik_v2(obs_tbl, sys_tbl, conc) AS TABLE
 WITH _sarimax_ll2_args AS (
     SELECT conc::BIGINT AS zconc
@@ -2677,35 +2715,12 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params(c, r, p, q, bigp, bigq) AS (
 -- an invalid stationary initialization must poison the likelihood with NULL.
 CREATE OR REPLACE MACRO _sarimax_doubling_cov(fold_state, tmat, rqr, k) AS (
     (list_transform([struct_pack(state := fold_state, tm := tmat, rq := rqr, dim := k)],
-      lambda zdcargs:
-        CASE WHEN len(list_filter(zdcargs.state.zaa,
+      lambda zdcfold:
+        CASE WHEN len(list_filter(zdcfold.state.zaa,
                                   lambda ze: ze IS DISTINCT FROM 0e0)) = 0
-             THEN _sarimax_msym(zdcargs.state.zsm, zdcargs.dim)
-             ELSE (list_transform([_sarimax_lyap(zdcargs.tm, zdcargs.rq, zdcargs.dim)],
-               lambda zdcov:
-                 (list_transform([_sarimax_mmul(zdcargs.tm, zdcov,
-                                                zdcargs.dim, zdcargs.dim, zdcargs.dim)],
-                   lambda zdctp:
-                     (list_transform([_sarimax_mtrans(zdcargs.tm, zdcargs.dim, zdcargs.dim)],
-                       lambda zdctt:
-                         (list_transform([_sarimax_mmul(zdctp, zdctt,
-                                                        zdcargs.dim, zdcargs.dim, zdcargs.dim)],
-                           lambda zdctpt:
-                             (list_transform([struct_pack(
-                                 residual := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
-                                     lambda zi: abs(zdcov[zi]-zdctpt[zi]-zdcargs.rq[zi]))),
-                                 scale := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
-                                     lambda zi: abs(zdcov[zi])+abs(zdctpt[zi])+abs(zdcargs.rq[zi])))
-                             )], lambda zdccheck:
-                                 CASE WHEN isfinite(zdccheck.residual) AND isfinite(zdccheck.scale)
-                                           AND zdccheck.residual <= 1e-10 * zdccheck.scale
-                                      THEN _sarimax_msym(zdcov, zdcargs.dim)
-                                      ELSE list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
-                                                          lambda zi: NULL::DOUBLE) END))[1]
-                         ))[1]
-                     ))[1]
-                 ))[1]
-             ))[1] END))[1]
+             THEN _sarimax_msym(zdcfold.state.zsm, zdcfold.dim)
+             ELSE _sarimax_msym(_sarimax_lyap_checked(zdcfold.tm, zdcfold.rq, zdcfold.dim),
+                                zdcfold.dim) END))[1]
 );
 
 -- ---- 2a. scalar loglikelihood kernel -----------------------------------------
@@ -3972,7 +3987,8 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
    SELECT struct_pack(
        ll := CASE WHEN loglik IS NOT NULL AND isfinite(loglik)
                   THEN loglik ELSE NULL END,
-       scale2 := CASE WHEN conc THEN scale2
+       scale2 := CASE WHEN NOT coalesce(isfinite(loglik), false) THEN NULL
+                      WHEN conc THEN scale2
                       ELSE cpar[ktrend + r + p + q + bigp + bigq + 1] END)
    FROM _sarimax_lro_ll WHERE enabled)
 );
@@ -7150,7 +7166,7 @@ SELECT pm.idx, pm.name,
        pm.value AS coefficient,
        bs.value AS std_error,
        pm.value / bs.value AS z_stat,
-       2e0 * (1e0 - _sarimax_norm_cdf(abs(pm.value / bs.value))) AS p_value,
+       2e0 * _sarimax_norm_cdf(-abs(pm.value / bs.value)) AS p_value,
        pm.value - _sarimax_norm_ppf(0.975e0) * bs.value AS ci_lo,
        pm.value + _sarimax_norm_ppf(0.975e0) * bs.value AS ci_hi
 FROM (SELECT * FROM query_table(model) WHERE kind = 'param') pm

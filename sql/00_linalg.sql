@@ -333,6 +333,39 @@ CREATE OR REPLACE MACRO _sarimax_lyap(t, r_qr, k) AS (
 );
 
 
+-- Stationary initialization must satisfy P = T P T' + Q. The dense
+-- solver can skip singular pivots, so validate its residual before filtering.
+-- Return the unsymmetrized solve to preserve the caller's arithmetic.
+CREATE OR REPLACE MACRO _sarimax_lyap_checked(tmat, rqr, k) AS (
+    (list_transform([struct_pack(tm := tmat, rq := rqr, dim := k)],
+      lambda zdcargs:
+         (list_transform([_sarimax_lyap(zdcargs.tm, zdcargs.rq, zdcargs.dim)],
+               lambda zdcov:
+                 (list_transform([_sarimax_mmul(zdcargs.tm, zdcov,
+                                                zdcargs.dim, zdcargs.dim, zdcargs.dim)],
+                   lambda zdctp:
+                     (list_transform([_sarimax_mtrans(zdcargs.tm, zdcargs.dim, zdcargs.dim)],
+                       lambda zdctt:
+                         (list_transform([_sarimax_mmul(zdctp, zdctt,
+                                                        zdcargs.dim, zdcargs.dim, zdcargs.dim)],
+                           lambda zdctpt:
+                             (list_transform([struct_pack(
+                                 residual := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                     lambda zi: abs(zdcov[zi]-zdctpt[zi]-zdcargs.rq[zi]))),
+                                 scale := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                     lambda zi: abs(zdcov[zi])+abs(zdctpt[zi])+abs(zdcargs.rq[zi])))
+                             )], lambda zdccheck:
+                                 CASE WHEN isfinite(zdccheck.residual) AND isfinite(zdccheck.scale)
+                                           AND zdccheck.residual <= 1e-10 * zdccheck.scale
+                                      THEN zdcov
+                                      ELSE list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                                          lambda zi: NULL::DOUBLE) END))[1]
+                         ))[1]
+                     ))[1]
+                 ))[1]
+             ))[1]))[1]
+);
+
 -- ----------------------------------------------------------------------------
 -- B. Relational encoding (table macros; table names as strings)
 -- ----------------------------------------------------------------------------

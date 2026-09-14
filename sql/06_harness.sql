@@ -780,7 +780,7 @@ SELECT pm.idx, pm.name,
        pm.value AS coefficient,
        bs.value AS std_error,
        pm.value / bs.value AS z_stat,
-       2e0 * (1e0 - _sarimax_norm_cdf(abs(pm.value / bs.value))) AS p_value,
+       2e0 * _sarimax_norm_cdf(-abs(pm.value / bs.value)) AS p_value,
        pm.value - _sarimax_norm_ppf(0.975e0) * bs.value AS ci_lo,
        pm.value + _sarimax_norm_ppf(0.975e0) * bs.value AS ci_hi
 FROM (SELECT * FROM query_table(model) WHERE kind = 'param') pm

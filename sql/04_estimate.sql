@@ -146,35 +146,12 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params(c, r, p, q, bigp, bigq) AS (
 -- an invalid stationary initialization must poison the likelihood with NULL.
 CREATE OR REPLACE MACRO _sarimax_doubling_cov(fold_state, tmat, rqr, k) AS (
     (list_transform([struct_pack(state := fold_state, tm := tmat, rq := rqr, dim := k)],
-      lambda zdcargs:
-        CASE WHEN len(list_filter(zdcargs.state.zaa,
+      lambda zdcfold:
+        CASE WHEN len(list_filter(zdcfold.state.zaa,
                                   lambda ze: ze IS DISTINCT FROM 0e0)) = 0
-             THEN _sarimax_msym(zdcargs.state.zsm, zdcargs.dim)
-             ELSE (list_transform([_sarimax_lyap(zdcargs.tm, zdcargs.rq, zdcargs.dim)],
-               lambda zdcov:
-                 (list_transform([_sarimax_mmul(zdcargs.tm, zdcov,
-                                                zdcargs.dim, zdcargs.dim, zdcargs.dim)],
-                   lambda zdctp:
-                     (list_transform([_sarimax_mtrans(zdcargs.tm, zdcargs.dim, zdcargs.dim)],
-                       lambda zdctt:
-                         (list_transform([_sarimax_mmul(zdctp, zdctt,
-                                                        zdcargs.dim, zdcargs.dim, zdcargs.dim)],
-                           lambda zdctpt:
-                             (list_transform([struct_pack(
-                                 residual := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
-                                     lambda zi: abs(zdcov[zi]-zdctpt[zi]-zdcargs.rq[zi]))),
-                                 scale := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
-                                     lambda zi: abs(zdcov[zi])+abs(zdctpt[zi])+abs(zdcargs.rq[zi])))
-                             )], lambda zdccheck:
-                                 CASE WHEN isfinite(zdccheck.residual) AND isfinite(zdccheck.scale)
-                                           AND zdccheck.residual <= 1e-10 * zdccheck.scale
-                                      THEN _sarimax_msym(zdcov, zdcargs.dim)
-                                      ELSE list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
-                                                          lambda zi: NULL::DOUBLE) END))[1]
-                         ))[1]
-                     ))[1]
-                 ))[1]
-             ))[1] END))[1]
+             THEN _sarimax_msym(zdcfold.state.zsm, zdcfold.dim)
+             ELSE _sarimax_msym(_sarimax_lyap_checked(zdcfold.tm, zdcfold.rq, zdcfold.dim),
+                                zdcfold.dim) END))[1]
 );
 
 -- ---- 2a. scalar loglikelihood kernel -----------------------------------------
@@ -1441,7 +1418,8 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_ooc_v2(cpar, y_tbl, exog_tbl, degs_tbl,
    SELECT struct_pack(
        ll := CASE WHEN loglik IS NOT NULL AND isfinite(loglik)
                   THEN loglik ELSE NULL END,
-       scale2 := CASE WHEN conc THEN scale2
+       scale2 := CASE WHEN NOT coalesce(isfinite(loglik), false) THEN NULL
+                      WHEN conc THEN scale2
                       ELSE cpar[ktrend + r + p + q + bigp + bigq + 1] END)
    FROM _sarimax_lro_ll WHERE enabled)
 );

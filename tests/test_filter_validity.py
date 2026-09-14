@@ -36,3 +36,12 @@ def test_invalid_boundary_probe_stays_invalid(
         SELECT _sarimax_ll_mean_v2(g,?,list_transform(range(1,14),lambda i:0e0)) FROM gains''',
         [params, concentrate, y, s, d, sd, concentrate, y]).fetchone()[0]
     assert shared == result
+    con.execute("CREATE OR REPLACE TABLE boundary_y(t BIGINT, y DOUBLE)")
+    con.executemany("INSERT INTO boundary_y VALUES (?, ?)", list(enumerate(y, 1)))
+    con.execute("CREATE OR REPLACE TABLE boundary_x(t BIGINT, j BIGINT, x DOUBLE)")
+    con.execute("CREATE OR REPLACE TABLE boundary_degs(idx BIGINT, degree BIGINT)")
+    relational = con.execute("""
+        SELECT _sarimax_ll_x_ooc_v2(?, 'boundary_y', 'boundary_x', 'boundary_degs',
+                                    0,1,0,0,0,?,?,?,0,?)
+        """, [params, s, d, sd, concentrate]).fetchone()[0]
+    assert relational == result
