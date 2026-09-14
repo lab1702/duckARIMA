@@ -256,3 +256,49 @@ Validation: the existing 80 targeted tests passed, covering transition
 arithmetic, v2 fixtures, mixed transition structures, missing observations,
 concentrated scale, live statsmodels checks, the low-memory relational path,
 and generated assembly. No fixtures or tolerances changed.
+
+## Follow-up: retain system columns in the compact recursive state
+
+Against `56f0041`, the compact filter still joined each recursive row to the
+same system row on every timestep. It now carries `k`, the intercept/burn
+indices, transition matrices, sparse support, and process covariance as ordinary
+columns beside the current Kalman state. The recursive step needs only the
+observation join. These extra columns are omitted from the returned result.
+
+`USING KEY (probe_id)` replaces the current row on every step, so the added
+storage scales with probes and state dimension, not observation count. It does
+increase the constant amount of retained per-probe state. The full-trace filter
+is unchanged, avoiding duplication of invariant matrices across saved timesteps.
+The scalar fitting path is also unchanged.
+
+The ordinary-column representation matters: a previous struct-based version
+added extraction overhead and was slower. This pass also tested bounded batches
+of 16 and 128 observations using fixed-size aggregate slots; both were slower
+than the original filter and were discarded. There is no batched observation
+list in the retained implementation.
+
+Full-likelihood measurements on DuckDB 1.5.5, one thread, against `56f0041`:
+500-row measurements used seven timed executions after a warmup, while the
+2,000-row measurements used three. Baseline and tuned runs were sequential,
+with no competing tests. The table reports medians.
+
+| Rows | State dimension | Previous main | Retained system columns | Time reduction |
+|---|---|---:|---:|---:|
+| 500 | 2 | 303 ms | 296 ms | 2% |
+| 500 | 14 | 360 ms | 332 ms | 8% |
+| 500 | 27 | 530 ms | 486 ms | 8% |
+| 2,000 | 2 | 1,194 ms | 1,181 ms | 1% |
+| 2,000 | 14 | 1,468 ms | 1,366 ms | 7% |
+| 2,000 | 27 | 2,099 ms | 1,961 ms | 7% |
+
+The k2 differences are within timing variation. Separate 500-row final-state
+benchmarks (five repetitions) changed from 296/351/499 ms to 270/324/469 ms for
+k2/k14/k27. Every final-state field and every measured likelihood matched the
+baseline exactly. The analyzed recursive plans contain one hash join rather
+than two. Observation access still occurs per timestep, so this does not remove
+the filter's long-series scaling limitations.
+
+Validation: 80 targeted tests passed, including the 20 MB relational likelihood
+regression, mixed state dimensions and transition types, time gaps and empty
+probes, v2 fixtures, live statsmodels checks, and generated assembly. No fixtures,
+public result columns, or numerical tolerances changed.

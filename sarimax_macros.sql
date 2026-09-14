@@ -2341,7 +2341,9 @@ UNION ALL
 SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_shift_input', true, use_shift := true);
 
 -- Compact variant (USING KEY probe_id: each iteration replaces the row, only
--- the final state survives). Same arithmetic as _sarimax_kfilter_v2. Returns
+-- the final state survives). Carry invariant system columns with that row to
+-- avoid a system join at every step; storage stays per probe, not per timestep.
+-- Same arithmetic as _sarimax_kfilter_v2. Returns
 -- (probe_id, n_eff, a, p, cnt, sumlogf, ssq); note the shifted-basis caveat
 -- above about the missing c_{n+1} term in the final a when kdiff > 0.
 CREATE OR REPLACE MACRO _sarimax_kfilter_state_impl_v2(obs_tbl, sys_tbl, use_sparse, use_shift := false) AS TABLE
@@ -2362,6 +2364,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
 ), _sarimax_kfs2 USING KEY (probe_id) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,
+           s.k, s.cidx, s.burn, s.tmat, s.tmat_t, s.tnz, s.rqr,
            s.a1f AS a,
            s.p1f AS p,
            0::BIGINT AS cnt,
@@ -2369,7 +2372,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
            0e0 AS ssq
     FROM _sarimax_sparse_sys s
     UNION ALL
-    SELECT probe_id, t,
+    SELECT probe_id, t, k, cidx, burn, tmat, tmat_t, tnz, rqr,
            list_transform(range(1, k + 1), lambda zi:
                ta[zi]
                + (CASE WHEN v IS NULL THEN 0e0 ELSE tpz[zi] * v / f END)
@@ -2383,7 +2386,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
            ssq + CASE WHEN v IS NOT NULL AND t > burn
                       THEN v * v / f ELSE 0e0 END AS ssq
     FROM (
-        SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, ct, v, f, ta, tpz,
+        SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, tmat, tmat_t, tnz, rqr, ct, v, f, ta, tpz,
                -- Preserve (TPT' - outer) + RQR arithmetic, but allocate only
                -- the final list. Missing observations skip the subtraction.
                list_transform(range(1, k * k + 1), lambda zidx:
@@ -2392,7 +2395,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                               * tpz[(zidx - 1) % k + 1] / f END)
                    + rqr[zidx]) AS prqr
         FROM (
-            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
+            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, tmat, tmat_t, tnz, rqr, ct,
                    v, f, ta, tpz,
                    CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
                         ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt
@@ -2404,18 +2407,16 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                        ta
                 FROM (
                     SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.cnt,
-                           kfs.sumlogf, kfs.ssq, s.k AS k, s.cidx, s.burn,
-                           s.tmat, s.tmat_t, s.tnz, s.rqr,
+                           kfs.sumlogf, kfs.ssq, kfs.k AS k, kfs.cidx, kfs.burn,
+                           kfs.tmat, kfs.tmat_t, kfs.tnz, kfs.rqr,
                            o.ct AS ct,
                            o.yd - kfs.a[1] AS v,
                            kfs.p[1] AS f,
-                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k)
-                                ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.p, s.k, s.k, is_shift := use_shift) END AS tp,
-                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1)
-                                ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.a, s.k, 1, is_shift := use_shift) END AS ta
+                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(kfs.tmat, kfs.p, kfs.k, kfs.k, kfs.k)
+                                ELSE _sarimax_transition_left(kfs.tmat, kfs.tnz, kfs.p, kfs.k, kfs.k, is_shift := use_shift) END AS tp,
+                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(kfs.tmat, kfs.a, kfs.k, kfs.k, 1)
+                                ELSE _sarimax_transition_left(kfs.tmat, kfs.tnz, kfs.a, kfs.k, 1, is_shift := use_shift) END AS ta
                     FROM _sarimax_kfs2 kfs
-                    JOIN _sarimax_sparse_sys s
-                      ON s.probe_id = kfs.probe_id
                     JOIN _sarimax_step_obs o
                       ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
                 )
