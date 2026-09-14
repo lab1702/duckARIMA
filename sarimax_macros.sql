@@ -6437,13 +6437,13 @@ ORDER BY 1, 2;
 
 -- ---- distribution helpers ------------------------------------------------------
 -- Regularized incomplete gamma: series for x < a+1, Lentz continued fraction
--- otherwise; fixed 200-term folds (deterministic, converged to ~1e-15 long
--- before). P(a,x) + Q(a,x) = 1.
+-- otherwise. The iteration budget grows with sqrt(a) to cover the widening
+-- transition region around x = a for large shapes. P(a,x) + Q(a,x) = 1.
 
 CREATE OR REPLACE MACRO _sarimax_gser(za, zx) AS (
     (list_reduce(
         [struct_pack(ap := za, del := 1e0 / za, tot := 1e0 / za)]
-        || list_transform(range(1, 201), lambda zi:
+        || list_transform(range(1, 201 + ceil(12e0 * sqrt(za))::BIGINT), lambda zi:
                struct_pack(ap := 0e0, del := 0e0, tot := 0e0)),
         lambda zacc, ze:
             struct_pack(ap := zacc.ap + 1e0,
@@ -6456,7 +6456,7 @@ CREATE OR REPLACE MACRO _sarimax_gcf(za, zx) AS (
     (list_reduce(
         [struct_pack(bb := zx + 1e0 - za, cc := 1e300, dd := 1e0 / (zx + 1e0 - za),
                      hh := 1e0 / (zx + 1e0 - za), ii := 0e0)]
-        || list_transform(range(1, 201), lambda zi:
+        || list_transform(range(1, 201 + ceil(12e0 * sqrt(za))::BIGINT), lambda zi:
                struct_pack(bb := 0e0, cc := 0e0, dd := 0e0, hh := 0e0, ii := 0e0)),
         lambda zacc, ze:
             (list_transform(
@@ -7485,8 +7485,8 @@ _sarimax_fc_scale AS (
 SELECT zdf.h,
        zor.mean_orig AS yhat,
        sqrt(zor.var_orig * zs.sc) AS se,
-       zor.mean_orig - _sarimax_norm_ppf(0.5e0 + level / 2e0) * sqrt(zor.var_orig * zs.sc) AS lo,
-       zor.mean_orig + _sarimax_norm_ppf(0.5e0 + level / 2e0) * sqrt(zor.var_orig * zs.sc) AS hi,
+       zor.mean_orig - (-_sarimax_norm_ppf((1e0 - level) / 2e0)) * sqrt(zor.var_orig * zs.sc) AS lo,
+       zor.mean_orig + (-_sarimax_norm_ppf((1e0 - level) / 2e0)) * sqrt(zor.var_orig * zs.sc) AS hi,
        zdf.mean_diff AS yhat_diff,
        sqrt(zdf.var_diff * zs.sc) AS se_diff
 FROM _sarimax_fc_diffres zdf
