@@ -13,6 +13,14 @@ import time
 import duckdb
 
 ROOT = Path(__file__).resolve().parents[1]
+CASES = {
+    'k2': '0,1,1,0,0,1,0,0,0,false',
+    'k4': '0,0,1,0,1,2,0,0,0,false',
+    'k6': '0,0,1,0,1,4,0,0,0,false',
+    'k8': '0,0,1,0,1,6,0,0,0,false',
+    'k14': '0,0,1,0,1,12,0,0,0,false',
+    'k27': '0,0,1,0,1,12,1,1,0,false',
+}
 
 
 def main():
@@ -20,6 +28,7 @@ def main():
     parser.add_argument('--macros', type=Path, default=ROOT / 'sarimax_macros.sql')
     parser.add_argument('--output', type=Path, default=ROOT / 'scratch/profile')
     parser.add_argument('--mode', choices=['state', 'trace', 'likelihood'], default='state')
+    parser.add_argument('--cases', nargs='+', choices=CASES, default=['k2', 'k14', 'k27'])
     parser.add_argument('--params', type=float, nargs=3, default=[0.3, 0.2, 1.0],
                         metavar=('COEF1', 'COEF2', 'VARIANCE'))
     parser.add_argument('--rows', type=int, default=150)
@@ -44,9 +53,8 @@ def main():
     c.execute('CREATE TABLE degrees(idx BIGINT, degree BIGINT)')
     summary = {'duckdb': duckdb.__version__, 'mode': args.mode, 'rows': args.rows,
                'threads': args.threads, 'params': args.params, 'cases': {}}
-    for name, orders in [('k2', '0,1,1,0,0,1,0,0,0,false'),
-                         ('k14', '0,0,1,0,1,12,0,0,0,false'),
-                         ('k27', '0,0,1,0,1,12,1,1,0,false')]:
+    for name in args.cases:
+        orders = CASES[name]
         c.execute(f"CREATE OR REPLACE TABLE sys AS SELECT * FROM _sarimax_systems_v2('probes', {orders})")
         if args.mode == 'likelihood':
             query = (f"SELECT _sarimax_ll_c_ooc_v2({params_sql}, "

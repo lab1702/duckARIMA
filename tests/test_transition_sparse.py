@@ -73,6 +73,21 @@ def test_relational_dispatch_matches_dense_for_mixed_systems(con, threads):
             UNION ALL
             SELECT * REPLACE (2 AS probe_id) FROM
                 _sarimax_systems_v2('mixed_probes',0,0,1,0,1,12,1,1,0,false)
+            UNION ALL
+            SELECT * REPLACE (3 AS probe_id) FROM
+                _sarimax_systems_v2('mixed_probes',0,0,1,0,1,2,0,0,0,false)
+            UNION ALL
+            SELECT * REPLACE (4 AS probe_id) FROM
+                _sarimax_systems_v2('mixed_probes',0,0,1,0,1,6,0,0,0,false)
+            UNION ALL
+            SELECT * REPLACE (5 AS probe_id) FROM
+                _sarimax_systems_v2('mixed_probes',0,0,1,0,1,12,0,0,0,false)
+            UNION ALL
+            SELECT * REPLACE (
+                6 AS probe_id,
+                list_transform(tmat, lambda v, i: CASE WHEN i = 1 THEN 1e-12 ELSE v END) AS tmat,
+                list_transform(tmat_t, lambda v, i: CASE WHEN i = 1 THEN 1e-12 ELSE v END) AS tmat_t)
+            FROM _sarimax_systems_v2('mixed_probes',0,0,1,0,1,12,0,0,0,false)
         """)
         con.execute("""
             CREATE OR REPLACE TABLE mixed_obs AS
@@ -123,3 +138,34 @@ def test_precomputed_intercepts_preserve_time_gaps_and_empty_probes(con):
     """).fetchall()
     assert trace == [(1, 1, 2.0, 1.0), (1, 2, None, 1.0),
                      (2, 1, 2.0, 1.0), (2, 2, None, 1.0)]
+
+
+@pytest.mark.parametrize('k', [4, 14, 27])
+@pytest.mark.parametrize('invalid', [None, 'null', 'inf', 'nan', 'negative_zero'])
+def test_shift_products_match_dense(con, k, invalid):
+    rng = np.random.default_rng(k)
+    tm = np.eye(k, k, 1).ravel().tolist()
+    b = rng.normal(size=k*k).tolist()
+    if invalid:
+        b[k+1] = {'null': None, 'inf': float('inf'), 'nan': float('nan'),
+                  'negative_zero': -0.0}[invalid]
+    con.execute('CREATE OR REPLACE TABLE shift_products AS '
+                'SELECT ?::DOUBLE[] AS tm, ?::DOUBLE[] AS b', [tm, b])
+    row = con.execute(f"""
+        WITH m AS MATERIALIZED (
+            SELECT *, _sarimax_transition_rows(tm,{k}) AS nz FROM shift_products
+        )
+        SELECT _sarimax_transition_left(tm,nz,b,{k},{k},is_shift := true),
+               _sarimax_mmul(tm,b,{k},{k},{k}),
+               _sarimax_transition_right(tm,nz,b,{k},is_shift := true),
+               _sarimax_mmul(b,_sarimax_mtrans(tm,{k},{k}),{k},{k},{k}),
+               _sarimax_transition_left(tm,nz,list_slice(b,1,{k}),{k},1,is_shift := true),
+               _sarimax_mmul(tm,list_slice(b,1,{k}),{k},{k},1)
+        FROM m
+    """).fetchone()
+    for got, expected in zip(row[::2], row[1::2]):
+        assert [v is None for v in got] == [v is None for v in expected]
+        np.testing.assert_array_equal(np.asarray(got, dtype=float),
+                                      np.asarray(expected, dtype=float))
+        if invalid in [None, 'negative_zero']:
+            assert np.asarray(got).tobytes() == np.asarray(expected).tobytes()

@@ -169,3 +169,53 @@ All six baseline/tuned likelihood comparisons were exactly equal. Validation:
 This includes the new shift-versus-dense covariance comparisons, general-solver
 fixtures, both filter generations, live statsmodels checks, low-memory
 likelihood checks, and assembly. No fixtures or numerical tolerances changed.
+
+## Follow-up: copy products for pure-shift filters
+
+After `588f345`, the 14-state seasonal filter again spent most of its value work
+in the `T*P`, `T*a`, and `TP*T'` projections. A generic sparse-threshold sweep at
+500 rows found that switching 4–8-state systems to the existing sparse products
+was slower than dense multiplication. That change was not retained.
+
+The new path specializes exact pure-shift transitions of dimension **14 or
+larger**. `T*P` copies adjacent rows, `T*a` copies adjacent elements, and `P*T'`
+copies adjacent columns, with zeros at the boundaries. These products take
+O(k²), O(k), and O(k²) value work respectively. The kernels retain the dense
+fallback for NULL/nonfinite operands and preserve the leading zero addition
+used by the ordered dense fold, including signed-zero behavior in the tests.
+
+The dispatcher now creates separate dense, generic sparse, and pure-shift
+recursive plans. The shift flag is checked once from exact matrix entries;
+near-shift matrices do not qualify. A constant flag in each recursive plan lets
+DuckDB discard unused expressions. The general sparse cutoff remains 20 and
+the scalar engine keeps its existing behavior. The extra plan adds a few
+milliseconds to preparation and small per-system intermediates, not an
+input-sized LIST.
+
+The profiling tool's `--cases` option selects state dimensions to investigate:
+`k2 k4 k6 k8 k14 k27` (the default remains `k2 k14 k27`). Example:
+
+```bash
+python tools/profile_filter.py --mode state --cases k2 k4 k6 k8 k14 k27 --rows 500 --repeats 5
+```
+
+Final full-likelihood comparison against `588f345`: DuckDB 1.5.5, one thread,
+500 observations, seven measured executions after one warmup:
+
+| State dimension | Previous main | Specialized shift path | Time reduction |
+|---|---:|---:|---:|
+| 2 | 327 ms | 324 ms | 1% |
+| 14 | 494 ms | 386 ms | 22% |
+| 27 | 570 ms | 561 ms | 2% |
+
+The small differences for k2/k27 are timing variation. For k14, the instrumented
+`T*P`/`T*a` projection fell from 110 ms to 20 ms and the `TP*T'`/outer-product
+projection from 85 ms to 17 ms. A separate full-trace comparison (five measured
+executions, same inputs) improved from 468 ms to 371 ms, with all trace values
+exactly equal. All three full-likelihood results also matched exactly.
+
+Validation: 80 targeted tests passed, including copy-versus-dense arithmetic
+with signed zero and nonfinite inputs, mixed dense/sparse/shift/near-shift
+systems at one and four threads, v2 fixtures, live statsmodels comparisons,
+low-memory likelihoods, and assembly. The strengthened mixed-system test was
+also rerun after adding its near-shift case. No fixtures or tolerances changed.

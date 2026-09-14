@@ -529,7 +529,7 @@ LEFT JOIN _sarimax_oa2o_int di
 --   f <= 0, poisoning the accumulator), ssq += v^2/f.
 -- The intercept c applied at step t is ct at row t + 1 when kdiff > 0 (the
 -- shifted-basis timing; 0 beyond the sample) and ct at row t when kdiff = 0.
-CREATE OR REPLACE MACRO _sarimax_kfilter_impl_v2(obs_tbl, sys_tbl, use_sparse) AS TABLE
+CREATE OR REPLACE MACRO _sarimax_kfilter_impl_v2(obs_tbl, sys_tbl, use_sparse, use_shift := false) AS TABLE
 WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     -- Cache transition support once per system, outside the time recursion.
     SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
@@ -582,7 +582,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                 SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
                        v, f, ta, tpz,
                        CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
-                            ELSE _sarimax_transition_right(tmat, tnz, tp, k) END AS tpt,
+                            ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt,
                        list_transform(range(1, k * k + 1), lambda zidx:
                            tpz[(zidx - 1) // k + 1]
                            * tpz[(zidx - 1) % k + 1] / f) AS outerm
@@ -600,9 +600,9 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                                o.yd - kf.a[1] AS v,
                                kf.p[1] AS f,
                                CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.p, s.k, s.k) END AS tp,
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.p, s.k, s.k, is_shift := use_shift) END AS tp,
                                CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.a, s.k, 1) END AS ta
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.a, s.k, 1, is_shift := use_shift) END AS ta
                         FROM _sarimax_kf2 kf
                         JOIN _sarimax_sparse_sys s
                           ON s.probe_id = kf.probe_id
@@ -618,23 +618,33 @@ SELECT probe_id, t, v, f, cnt, sumlogf, ssq
 FROM _sarimax_kf2
 WHERE t >= 1;
 
--- Separate recursive plans let DuckDB discard sparse expression trees entirely
--- for small systems. Filtering the seeds also supports mixed state dimensions.
+-- Separate dense, sparse, and shift plans let DuckDB discard unused arithmetic
+-- from each recursion. Filtering seeds supports mixed transition structures.
 CREATE OR REPLACE MACRO _sarimax_kfilter_v2(obs_tbl, sys_tbl) AS TABLE
-WITH _sarimax_dense_input AS MATERIALIZED (
-    SELECT * FROM query_table(sys_tbl) WHERE k < 20
+WITH _sarimax_dispatch_sys AS MATERIALIZED (
+    SELECT *, k >= 14 AND len(list_filter(range(1, k * k + 1), lambda zi:
+        tmat[zi] IS DISTINCT FROM
+            CASE WHEN (zi - 1) % k = (zi - 1) // k + 1
+                 THEN 1e0 ELSE 0e0 END)) = 0 AS shift_fast
+    FROM query_table(sys_tbl)
+), _sarimax_dense_input AS MATERIALIZED (
+    SELECT * FROM _sarimax_dispatch_sys WHERE k < 20 AND NOT shift_fast
 ), _sarimax_sparse_input AS MATERIALIZED (
-    SELECT * FROM query_table(sys_tbl) WHERE k >= 20
+    SELECT * FROM _sarimax_dispatch_sys WHERE k >= 20 AND NOT shift_fast
+), _sarimax_shift_input AS MATERIALIZED (
+    SELECT * FROM _sarimax_dispatch_sys WHERE shift_fast
 )
 SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_dense_input', false)
 UNION ALL
-SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_sparse_input', true);
+SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_sparse_input', true)
+UNION ALL
+SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_shift_input', true, use_shift := true);
 
 -- Compact variant (USING KEY probe_id: each iteration replaces the row, only
 -- the final state survives). Same arithmetic as _sarimax_kfilter_v2. Returns
 -- (probe_id, n_eff, a, p, cnt, sumlogf, ssq); note the shifted-basis caveat
 -- above about the missing c_{n+1} term in the final a when kdiff > 0.
-CREATE OR REPLACE MACRO _sarimax_kfilter_state_impl_v2(obs_tbl, sys_tbl, use_sparse) AS TABLE
+CREATE OR REPLACE MACRO _sarimax_kfilter_state_impl_v2(obs_tbl, sys_tbl, use_sparse, use_shift := false) AS TABLE
 WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
     -- Cache transition support once per system, outside the time recursion.
     SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
@@ -684,7 +694,7 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                 SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
                        v, f, ta, tpz,
                        CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
-                            ELSE _sarimax_transition_right(tmat, tnz, tp, k) END AS tpt,
+                            ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt,
                        list_transform(range(1, k * k + 1), lambda zidx:
                            tpz[(zidx - 1) // k + 1]
                            * tpz[(zidx - 1) % k + 1] / f) AS outerm
@@ -702,9 +712,9 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                                o.yd - kfs.a[1] AS v,
                                kfs.p[1] AS f,
                                CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.p, s.k, s.k) END AS tp,
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.p, s.k, s.k, is_shift := use_shift) END AS tp,
                                CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.a, s.k, 1) END AS ta
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.a, s.k, 1, is_shift := use_shift) END AS ta
                         FROM _sarimax_kfs2 kfs
                         JOIN _sarimax_sparse_sys s
                           ON s.probe_id = kfs.probe_id
@@ -719,17 +729,27 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
 SELECT probe_id, t AS n_eff, a, p, cnt, sumlogf, ssq
 FROM _sarimax_kfs2;
 
--- Separate recursive plans let DuckDB discard sparse expression trees entirely
--- for small systems. Filtering the seeds also supports mixed state dimensions.
+-- Separate dense, sparse, and shift plans let DuckDB discard unused arithmetic
+-- from each recursion. Filtering seeds supports mixed transition structures.
 CREATE OR REPLACE MACRO _sarimax_kfilter_state_v2(obs_tbl, sys_tbl) AS TABLE
-WITH _sarimax_dense_input AS MATERIALIZED (
-    SELECT * FROM query_table(sys_tbl) WHERE k < 20
+WITH _sarimax_dispatch_sys AS MATERIALIZED (
+    SELECT *, k >= 14 AND len(list_filter(range(1, k * k + 1), lambda zi:
+        tmat[zi] IS DISTINCT FROM
+            CASE WHEN (zi - 1) % k = (zi - 1) // k + 1
+                 THEN 1e0 ELSE 0e0 END)) = 0 AS shift_fast
+    FROM query_table(sys_tbl)
+), _sarimax_dense_input AS MATERIALIZED (
+    SELECT * FROM _sarimax_dispatch_sys WHERE k < 20 AND NOT shift_fast
 ), _sarimax_sparse_input AS MATERIALIZED (
-    SELECT * FROM query_table(sys_tbl) WHERE k >= 20
+    SELECT * FROM _sarimax_dispatch_sys WHERE k >= 20 AND NOT shift_fast
+), _sarimax_shift_input AS MATERIALIZED (
+    SELECT * FROM _sarimax_dispatch_sys WHERE shift_fast
 )
 SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_dense_input', false)
 UNION ALL
-SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_sparse_input', true);
+SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_sparse_input', true)
+UNION ALL
+SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_shift_input', true, use_shift := true);
 
 -- Loglikelihood per probe. conc: 0 = sigma2 lives in RQR (standard formula),
 -- 1 = concentrated scale (filter ran at sigma2 = 1; scale2 = ssq/cnt).

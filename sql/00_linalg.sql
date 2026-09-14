@@ -505,10 +505,14 @@ CREATE OR REPLACE MACRO _sarimax_transition_rows(tm, k) AS (
         list_filter(range(1, k + 1), lambda zj: tm[(zi - 1) * k + zj] <> 0e0)) END
 );
 
-CREATE OR REPLACE MACRO _sarimax_transition_left(tm, nz, b, k, n) AS (
-    CASE WHEN k < 20 OR nz IS NULL OR len(list_filter(b,
+-- is_shift is trusted cached metadata: true only for an exact superdiagonal
+-- shift. The relational filter gates that specialized copy path separately.
+CREATE OR REPLACE MACRO _sarimax_transition_left(tm, nz, b, k, n, is_shift := false) AS (
+    CASE WHEN (k < 20 AND NOT is_shift) OR nz IS NULL OR len(list_filter(b,
              lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
          THEN _sarimax_mmul(tm, b, k, k, n)
+    WHEN is_shift THEN list_transform(range(1, k * n + 1), lambda zi:
+        CASE WHEN zi <= (k - 1) * n THEN 0e0 + b[zi + n] ELSE 0e0 END)
     ELSE list_transform(range(1, k * n + 1), lambda zi:
         list_reduce(list_prepend(0e0,
             list_transform(nz[(zi - 1) // n + 1], lambda zj:
@@ -518,11 +522,13 @@ CREATE OR REPLACE MACRO _sarimax_transition_left(tm, nz, b, k, n) AS (
 
 -- a * transpose(tm), using the same cached rows of tm. Bind the dense
 -- fallback transpose once: passing it inline to _mmul repeats it per product.
-CREATE OR REPLACE MACRO _sarimax_transition_right(tm, nz, a, k) AS (
-    CASE WHEN k < 20 OR nz IS NULL OR len(list_filter(a,
+CREATE OR REPLACE MACRO _sarimax_transition_right(tm, nz, a, k, is_shift := false) AS (
+    CASE WHEN (k < 20 AND NOT is_shift) OR nz IS NULL OR len(list_filter(a,
              lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
          THEN (list_transform([_sarimax_mtrans(tm, k, k)], lambda ztt:
              _sarimax_mmul(a, ztt, k, k, k)))[1]
+    WHEN is_shift THEN list_transform(range(1, k * k + 1), lambda zi:
+        CASE WHEN (zi - 1) % k < k - 1 THEN 0e0 + a[zi + 1] ELSE 0e0 END)
     ELSE list_transform(range(1, k * k + 1), lambda zi:
         list_reduce(list_prepend(0e0,
             list_transform(nz[(zi - 1) % k + 1], lambda zj:
