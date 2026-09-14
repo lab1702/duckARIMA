@@ -809,8 +809,15 @@ CREATE OR REPLACE MACRO _sarimax_check_exog_names(model, exog_cols) AS (
 -- (and hence std_resid) is rescaled by meta sigma2 -- statsmodels' reported
 -- trace has F multiplied by the scale, the stored state runs at unit scale.
 CREATE OR REPLACE MACRO _sarimax_retrace(model, data, y_col, exog_cols, t_col) AS TABLE
-WITH _sarimax_rt_chk AS (
-    SELECT _sarimax_check_exog_names(model, exog_cols) AS ok
+WITH _sarimax_rt_exog AS MATERIALIZED (
+    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
+),
+_sarimax_rt_chk AS MATERIALIZED (
+    SELECT _sarimax_check_exog_names(model, exog_cols)
+           AND CASE WHEN (SELECT count(*) FILTER (WHERE x IS NULL) > 0
+                          FROM _sarimax_rt_exog)
+                    THEN error('sarimax: exog contains NULL values')
+                    ELSE true END AS ok
 ),
 -- spec values bound as columns once; effective INTEGRATION orders (d_eff,
 -- sd_eff: applied to the data up front, zero when sdiff = 0) vs ENGINE orders
@@ -837,9 +844,6 @@ _sarimax_rt_dims AS (
 _sarimax_rt_series AS (
     SELECT zs.t, zs.y FROM _sarimax_series_of(data, y_col, t_col) zs, _sarimax_rt_chk zc
     WHERE zc.ok
-),
-_sarimax_rt_exog AS (
-    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
 -- _sarimax_diff_dyn with d = D = 0 is an exact identity and
 -- propagates NULL y, so ONE call serves both sdiff modes.

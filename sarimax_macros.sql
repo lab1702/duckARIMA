@@ -2645,10 +2645,11 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params(c, r, p, q, bigp, bigq) AS (
 -- spec (5.3) pins the vec-trick Lyapunov solve for the FILTER's stationary
 -- initialization, which sql/03_filter.sql honors. The scalar kernel below is
 -- an internal evaluation path for the optimizer, where the k^2-by-k^2 linear
--- solve per probe is too slow; it instead computes P1 by 30 fixed DOUBLING
--- iterations (S <- S + A S A', A <- A A, starting from S = RQR', A = T),
--- which equals the exact stationary covariance to < 1e-12 for any spectral
--- radius <= 1 - 1e-6 (the truncation term is rho^(2^31)). Explosive probes
+-- solve per probe is too slow; it first computes P1 by 30 DOUBLING
+-- iterations (S <- S + A S A', A <- A A, starting from S = RQR', A = T).
+-- If the final transition power is nonzero, an exact Lyapunov solve with
+-- a residual check replaces the truncated sum. This covers stationary
+-- parameters arbitrarily near a unit root. Explosive probes
 -- diverge to inf/NaN, the loglikelihood poisons to NULL, and the line search
 -- rejects them -- exactly the TRY-style guard of spec 4.3. Kernel-vs-filter
 -- agreement is asserted at 1e-9 abs / 1e-11 rel in tests/test_estimate.py,
@@ -2667,6 +2668,45 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params(c, r, p, q, bigp, bigq) AS (
 -- innermost derived table of the LATERAL (plain, non-lambda projections),
 -- so lambdas only ever see local columns.
 -- ============================================================================
+
+-- A fixed doubling horizon is insufficient arbitrarily close to a unit
+-- root. Retain its exact arithmetic when T^(2^30) has become zero; otherwise
+-- use the same stationary Lyapunov solve as the relational filter. Bind the
+-- chosen covariance before symmetrization so a solve is evaluated only once.
+-- Check the fallback residual because the linear solver skips singular pivots;
+-- an invalid stationary initialization must poison the likelihood with NULL.
+CREATE OR REPLACE MACRO _sarimax_doubling_cov(fold_state, tmat, rqr, k) AS (
+    (list_transform([struct_pack(state := fold_state, tm := tmat, rq := rqr, dim := k)],
+      lambda zdcargs:
+        CASE WHEN len(list_filter(zdcargs.state.zaa,
+                                  lambda ze: ze IS DISTINCT FROM 0e0)) = 0
+             THEN _sarimax_msym(zdcargs.state.zsm, zdcargs.dim)
+             ELSE (list_transform([_sarimax_lyap(zdcargs.tm, zdcargs.rq, zdcargs.dim)],
+               lambda zdcov:
+                 (list_transform([_sarimax_mmul(zdcargs.tm, zdcov,
+                                                zdcargs.dim, zdcargs.dim, zdcargs.dim)],
+                   lambda zdctp:
+                     (list_transform([_sarimax_mtrans(zdcargs.tm, zdcargs.dim, zdcargs.dim)],
+                       lambda zdctt:
+                         (list_transform([_sarimax_mmul(zdctp, zdctt,
+                                                        zdcargs.dim, zdcargs.dim, zdcargs.dim)],
+                           lambda zdctpt:
+                             (list_transform([struct_pack(
+                                 residual := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                     lambda zi: abs(zdcov[zi]-zdctpt[zi]-zdcargs.rq[zi]))),
+                                 scale := list_sum(list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                     lambda zi: abs(zdcov[zi])+abs(zdctpt[zi])+abs(zdcargs.rq[zi])))
+                             )], lambda zdccheck:
+                                 CASE WHEN isfinite(zdccheck.residual) AND isfinite(zdccheck.scale)
+                                           AND zdccheck.residual <= 1e-10 * zdccheck.scale
+                                      THEN _sarimax_msym(zdcov, zdcargs.dim)
+                                      ELSE list_transform(range(1, zdcargs.dim*zdcargs.dim+1),
+                                                          lambda zi: NULL::DOUBLE) END))[1]
+                         ))[1]
+                     ))[1]
+                 ))[1]
+             ))[1] END))[1]
+);
 
 -- ---- 2a. scalar loglikelihood kernel -----------------------------------------
 
@@ -2704,7 +2744,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_c(cpar, wlist, xmat, r, p, q, bigp, bigq, s)
             ztt := _sarimax_mtrans(zl2.ztm, zl1.zk, zl1.zk),
             zrqr := _sarimax_build_rqr(zl2.zrv, zl1.zsigma2, zl1.zk))],
          lambda zl3:
-           -- P1: 30 doubling iterations (bind the fold result BEFORE msym --
+           -- P1: 30 doubling iterations plus an exact fallback (bind the fold result BEFORE msym --
            -- a lambda-dependent capture is re-evaluated per element, so msym
            -- over the raw fold expression would run the fold 2k^2 times)
            (list_transform([(list_reduce(
@@ -2724,9 +2764,9 @@ CREATE OR REPLACE MACRO _sarimax_ll_c(cpar, wlist, xmat, r, p, q, bigp, bigq, s)
                                                       zl1.zk, zl1.zk, zl1.zk))))[1]
                          ))[1]
                       ))[1]
-                 )).zsm],
+                 ))],
             lambda zs30:
-           (list_transform([_sarimax_msym(zs30, zl1.zk)],
+           (list_transform([_sarimax_doubling_cov(zs30, zl2.ztm, zl3.zrqr, zl1.zk)],
             lambda zp1:
               -- Kalman fold in strict t order; accumulator and elements share
               -- one struct type, per-step yd rides in the spare zydv field
@@ -3707,7 +3747,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
             zrqra := _sarimax_build_rqr(zl2.zrva, zl1.zsigma2, zl1.zka),
             za1u := _sarimax_basis_vector(_sarimax_a1_v2(zl2.zta, zl1.zka, d, sd, s, (zl2.zcl)[1]), zl2.zk, d, sd, s))],
          lambda zl3:
-           -- ARMA-block P1 by 30 doubling iterations (bound before msym)
+           -- ARMA-block P1: doubling with exact fallback (bound before msym)
            (list_transform([(list_reduce(
                     [struct_pack(zsm := zl3.zrqra, zaa := zl2.zta)]
                       || list_transform(range(1, 31), lambda zd2:
@@ -3734,9 +3774,9 @@ CREATE OR REPLACE MACRO _sarimax_ll_c_v2(cpar, ylist, xmat, degs,
                                                       zl1.zka, zl1.zka, zl1.zka))))[1]
                          ))[1]
                       ))[1] END
-                 )).zsm],
+                 ))],
             lambda zs30:
-           (list_transform([_sarimax_msym(zs30, zl1.zka)],
+           (list_transform([_sarimax_doubling_cov(zs30, zl2.zta, zl3.zrqra, zl1.zka)],
             lambda zsig:
               -- blockdiag(1e6 I_kdiff, Sigma), the UNSHIFTED P1
               (list_transform([list_transform(range(1, zl2.zk * zl2.zk + 1), lambda zidx:
@@ -4522,7 +4562,7 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
             zrqr := _sarimax_build_rqr(zl2.zrv, zl1.zsigma2, zl2.zk),
             zrqra := _sarimax_build_rqr(zl2.zrva, zl1.zsigma2, zl1.zka))],
          lambda zl3:
-           -- ARMA-block P1 by 30 doubling iterations (bound before msym) --
+           -- ARMA-block P1: doubling with exact fallback (bound before msym) --
            -- verbatim from _sarimax_ll_c_v2
            (list_transform([(list_reduce(
                     [struct_pack(zsm := zl3.zrqra, zaa := zl2.zta)]
@@ -4550,9 +4590,9 @@ CREATE OR REPLACE MACRO _sarimax_kf_gains_v2(cpar, ylist, xmat, degs,
                                                       zl1.zka, zl1.zka, zl1.zka))))[1]
                          ))[1]
                       ))[1] END
-                 )).zsm],
+                 ))],
             lambda zs30:
-           (list_transform([_sarimax_msym(zs30, zl1.zka)],
+           (list_transform([_sarimax_doubling_cov(zs30, zl2.zta, zl3.zrqra, zl1.zka)],
             lambda zsig:
               -- blockdiag(1e6 I_kdiff, Sigma), the UNSHIFTED P1
               (list_transform([list_transform(range(1, zl2.zk * zl2.zk + 1), lambda zidx:
@@ -7131,8 +7171,15 @@ CREATE OR REPLACE MACRO _sarimax_check_exog_names(model, exog_cols) AS (
 -- (and hence std_resid) is rescaled by meta sigma2 -- statsmodels' reported
 -- trace has F multiplied by the scale, the stored state runs at unit scale.
 CREATE OR REPLACE MACRO _sarimax_retrace(model, data, y_col, exog_cols, t_col) AS TABLE
-WITH _sarimax_rt_chk AS (
-    SELECT _sarimax_check_exog_names(model, exog_cols) AS ok
+WITH _sarimax_rt_exog AS MATERIALIZED (
+    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
+),
+_sarimax_rt_chk AS MATERIALIZED (
+    SELECT _sarimax_check_exog_names(model, exog_cols)
+           AND CASE WHEN (SELECT count(*) FILTER (WHERE x IS NULL) > 0
+                          FROM _sarimax_rt_exog)
+                    THEN error('sarimax: exog contains NULL values')
+                    ELSE true END AS ok
 ),
 -- spec values bound as columns once; effective INTEGRATION orders (d_eff,
 -- sd_eff: applied to the data up front, zero when sdiff = 0) vs ENGINE orders
@@ -7159,9 +7206,6 @@ _sarimax_rt_dims AS (
 _sarimax_rt_series AS (
     SELECT zs.t, zs.y FROM _sarimax_series_of(data, y_col, t_col) zs, _sarimax_rt_chk zc
     WHERE zc.ok
-),
-_sarimax_rt_exog AS (
-    SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
 -- _sarimax_diff_dyn with d = D = 0 is an exact identity and
 -- propagates NULL y, so ONE call serves both sdiff modes.
