@@ -7492,8 +7492,8 @@ _sarimax_fc_excheck AS MATERIALIZED (
     SELECT CASE
         WHEN count(*) <> (h)::BIGINT * (SELECT r FROM _sarimax_fc_dims)
         THEN error('sarimax: future exog coverage is incomplete; require horizons 1..' || (h)::VARCHAR)
-        WHEN count(*) FILTER (WHERE x IS NULL) > 0
-        THEN error('sarimax: NULL future exog values are not allowed')
+        WHEN count(*) FILTER (WHERE x IS NULL OR NOT isfinite(x)) > 0
+        THEN error('sarimax: NULL or non-finite future exog values are not allowed')
         ELSE true END AS ok
     FROM _sarimax_fc_exd
     WHERE t BETWEEN 1 AND (h)::BIGINT
