@@ -4780,7 +4780,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
            za2.zx AS zx, za2.zfx AS zfx, za2.zg_new AS zgx,
            list_transform(range(1, za2.znp * za2.znp + 1), lambda zidx:
                CASE WHEN (zidx - 1) // za2.znp = (zidx - 1) % za2.znp THEN 1e0 ELSE 0e0 END) AS zhinv,
-           CASE WHEN za2.zg_new IS NULL
+           CASE WHEN NOT coalesce(isfinite(za2.zfx), false)
+                     OR za2.zg_new IS NULL
                      OR len(list_filter(za2.zg_new, lambda ze: ze IS NULL)) > 0 THEN 3
                 WHEN list_reduce(list_prepend(0e0, list_transform(za2.zg_new, lambda ze: abs(ze))),
                                  lambda za, zb: greatest(za, zb)) <= 1e-9 THEN 1
@@ -6519,10 +6520,20 @@ CROSS JOIN (
 -- Layer 1's _sarimax_diff uses window lag(x, s), whose offset must be a
 -- constant -- fine for sarimax_fit (orders arrive as literals) but not for
 -- macros that read the orders back out of a model table (scalar subqueries).
--- These variants difference by explicit convolution with the coefficients of
--- (1-L)^d (1-L^s)^D: algebraically identical, floating-point-equal to ~1 ulp
--- (summation order differs from sequential differencing), and used ONLY on
--- the model-table-driven paths (residual diagnostics, forecasting).
+-- Use successive list subtractions so dynamic orders retain exactly the
+-- staged arithmetic and NULL propagation used while fitting.
+
+CREATE OR REPLACE MACRO _sarimax_diff_values(zy, zd, zsd, zs) AS (
+    list_reduce(
+        list_prepend(
+            list_reduce(
+                list_prepend(zy, list_transform(range(1, zd + 1), lambda zi: []::DOUBLE[])),
+                lambda za, ze: list_transform(range(2, len(za) + 1),
+                    lambda zi: za[zi] - za[zi - 1])),
+            list_transform(range(1, zsd + 1), lambda zi: []::DOUBLE[])),
+        lambda za, ze: list_transform(range(zs + 1, len(za) + 1),
+            lambda zi: za[zi] - za[zi - zs]))
+);
 
 -- Coefficient list of (1-L)^d (1-L^s)^D, constant term first.
 CREATE OR REPLACE MACRO _sarimax_diff_poly(zd, zsd, zs) AS (
@@ -6540,51 +6551,31 @@ CREATE OR REPLACE MACRO _sarimax_diff_poly(zd, zsd, zs) AS (
 );
 
 CREATE OR REPLACE MACRO _sarimax_diff_dyn(tbl, tcol, ycol, d, sd, s) AS TABLE
-WITH _sarimax_dd_args AS (
-    SELECT d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs
-),
-_sarimax_dd_list AS (
-    SELECT za.zd, za.zsd, za.zs, za.zd + za.zsd * za.zs AS zoff,
-           _sarimax_diff_poly(za.zd, za.zsd, greatest(za.zs, 1)) AS zc,
+WITH _sarimax_dd_input AS (
+    SELECT d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs,
            (SELECT list(struct_extract(zrow, ycol)::DOUBLE
                         ORDER BY struct_extract(zrow, tcol)) FROM query_table(tbl) zrow) AS zy
-    FROM _sarimax_dd_args za
+),
+_sarimax_dd_list AS (
+    SELECT _sarimax_diff_values(zy, zd, zsd, zs) AS zw FROM _sarimax_dd_input
 )
-SELECT zu.zt AS t,
-       -- Match staged differencing's NULL propagation even when two paths
-       -- cancel algebraically (for example d=2, D=1, s=2 at lag 2).
-       CASE WHEN list_contains(flatten(list_transform(range(0, zl.zd + 1), lambda zi:
-           list_transform(range(0, zl.zsd + 1), lambda zj:
-               zl.zy[zu.zt + zl.zoff - zi - zj * zl.zs] IS NULL))), true)
-       THEN NULL ELSE list_reduce(
-           list_prepend(0e0, list_transform(range(1, len(zl.zc) + 1), lambda zi:
-               CASE WHEN zl.zc[zi] = 0e0 THEN 0e0
-                    ELSE zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)] END)),
-           lambda zacc, zx: zacc + zx) END AS w
+SELECT zu.zt AS t, zl.zw[zu.zt] AS w
 FROM _sarimax_dd_list zl,
-     LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
+     LATERAL unnest(range(1, len(zl.zw) + 1)) AS zu(zt);
 
 CREATE OR REPLACE MACRO _sarimax_diff_exog_dyn(tbl, d, sd, s) AS TABLE
-WITH _sarimax_de_args AS (
-    SELECT d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs
+WITH _sarimax_de_input AS (
+    SELECT ze.j, list(ze.x ORDER BY ze.t) AS zy,
+           d::INT AS zd, sd::INT AS zsd, s::BIGINT AS zs
+    FROM query_table(tbl) ze
+    GROUP BY ze.j
 ),
 _sarimax_de_lists AS (
-    SELECT ze.j,
-           za.zd + za.zsd * za.zs AS zoff,
-           _sarimax_diff_poly(za.zd, za.zsd, greatest(za.zs, 1)) AS zc,
-           list(ze.x ORDER BY ze.t) AS zy
-    FROM query_table(tbl) ze
-    CROSS JOIN _sarimax_de_args za
-    GROUP BY ze.j, za.zd, za.zsd, za.zs
+    SELECT j, _sarimax_diff_values(zy, zd, zsd, zs) AS zw FROM _sarimax_de_input
 )
-SELECT zu.zt AS t, zl.j,
-       list_reduce(
-           list_prepend(0e0, list_transform(range(1, len(zl.zc) + 1), lambda zi:
-               CASE WHEN zl.zc[zi] = 0e0 THEN 0e0
-                    ELSE zl.zc[zi] * zl.zy[zu.zt + zl.zoff - (zi - 1)] END)),
-           lambda zacc, zx: zacc + zx) AS x
+SELECT zu.zt AS t, zl.j, zl.zw[zu.zt] AS x
 FROM _sarimax_de_lists zl,
-     LATERAL unnest(range(1, len(zl.zy) - zl.zoff + 1)) AS zu(zt);
+     LATERAL unnest(range(1, len(zl.zw) + 1)) AS zu(zt);
 
 -- ---- v2 helpers: trend arg, NULL-tolerant differencing ---------------------------
 
@@ -6913,7 +6904,8 @@ _sarimax_f_names AS (
             THEN 'ma.S.L' || ((zi - dm.ktrend - dm.r - p - q - sp) * s)::VARCHAR
         ELSE 'sigma2' END) AS pnames
     FROM _sarimax_f_dims dm
-)
+),
+_sarimax_f_result AS (
 SELECT 'param' AS kind, nm.pnames[zu.zi] AS name, zu.zi::INT AS idx,
        ft.params[zu.zi] AS value, NULL::DOUBLE[] AS value_list
 FROM _sarimax_f_fit ft, _sarimax_f_names nm, _sarimax_f_dims dm,
@@ -6982,7 +6974,12 @@ UNION ALL
 SELECT 'state', 'P', NULL, NULL, st.p FROM _sarimax_f_state st
 UNION ALL
 SELECT 'state', 'k', NULL, sy.k::DOUBLE, NULL
-FROM (SELECT k FROM _sarimax_f_sys LIMIT 1) sy;
+FROM (SELECT k FROM _sarimax_f_sys LIMIT 1) sy
+)
+SELECT zr.* FROM _sarimax_f_result zr CROSS JOIN _sarimax_f_fit ft
+WHERE CASE WHEN NOT coalesce(isfinite(ft.loglik), false)
+           THEN error('sarimax: non-finite loglikelihood at the optimum')
+           ELSE true END;
 
 -- ---- model-table readers (internal) ---------------------------------------------
 
@@ -7068,7 +7065,7 @@ _sarimax_rt_series AS (
 _sarimax_rt_exog AS (
     SELECT t, j, x FROM _sarimax_exog_of(data, exog_cols, y_col, t_col)
 ),
--- _sarimax_diff_dyn with d = D = 0 is an exact identity (0e0 + 1e0 * y) and
+-- _sarimax_diff_dyn with d = D = 0 is an exact identity and
 -- propagates NULL y, so ONE call serves both sdiff modes.
 _sarimax_rt_y AS (
     SELECT t, w AS y FROM _sarimax_diff_dyn('_sarimax_rt_series', 't', 'y',
@@ -7362,11 +7359,11 @@ CREATE OR REPLACE MACRO sarimax_grid_sql(data, y_col, orders, t_col := NULL) AS 
                   || 'max(CASE WHEN name = ''aic'' THEN value END) AS aic, '
                   || 'max(CASE WHEN name = ''bic'' THEN value END) AS bic, '
                   || 'max(CASE WHEN name = ''converged'' THEN value END) AS converged '
-                  || 'FROM sarimax_fit(' || '''' || data || ''', ''' || y_col || ''', '
+                  || 'FROM sarimax_fit(' || '''' || replace(data, '''', '''''') || ''', ''' || replace(y_col, '''', '''''') || ''', '
                   || zo.p || ', ' || zo.d || ', ' || zo.q
                   || ', sp := ' || zo.sp || ', sd := ' || zo.sd || ', sq := ' || zo.sq
                   || ', s := ' || zo.s
-                  || CASE WHEN t_col IS NULL THEN '' ELSE ', t_col := ''' || t_col || '''' END
+                  || CASE WHEN t_col IS NULL THEN '' ELSE ', t_col := ''' || replace(t_col, '''', '''''') || '''' END
                   || ') WHERE kind = ''meta''',
         ' UNION ALL ' ORDER BY zo.p, zo.d, zo.q, zo.sp, zo.sd, zo.sq, zo.s)
      FROM query_table(orders) zo) || ' ORDER BY aic'

@@ -114,3 +114,63 @@ def test_fit_rejects_unidentified_exog(con, out_of_core,
                     f"exog_cols := {exog},t_col := 't',compute_bse := false,"
                     f"out_of_core := {out_of_core},"
                     f"simple_differencing := {simple_differencing})").fetchall()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("projection", ["*", "count(*)", "spec"])
+@pytest.mark.parametrize("value", ["0e0", "'Infinity'::DOUBLE"])
+def test_fit_rejects_nonfinite_optimum(con, out_of_core, projection, value):
+    con.execute(f"CREATE OR REPLACE TABLE poisoned AS SELECT t,{value} AS y "
+                "FROM range(1,31) q(t)")
+    columns = "value" if projection == "spec" else projection
+    suffix = " WHERE kind='spec'" if projection == "spec" else ""
+    # The relational likelihood rejects zero scale before reaching the fit gate.
+    message = "cannot take logarithm of zero" if out_of_core and value == "0e0" else "non-finite loglikelihood"
+    with pytest.raises(duckdb.Error, match=message):
+        con.execute(f"SELECT {columns} FROM sarimax_fit('poisoned','y',0,0,0,"
+                    "concentrate := true,compute_bse := false,t_col := 't',"
+                    f"out_of_core := {out_of_core})" + suffix).fetchall()
+
+
+@pytest.mark.parametrize("d,sd,s", [(0,0,1),(3,0,1),(4,0,1),(2,1,2),(4,3,2)])
+def test_dynamic_differencing_matches_staged_arithmetic(con, d, sd, s):
+    con.execute("CREATE OR REPLACE TABLE offset_data AS SELECT t,"
+                "1e16+2*(t%7) AS y FROM range(1,41) q(t)")
+    expected = con.execute(f"SELECT t,w FROM _sarimax_diff_nt("
+                           f"'offset_data','t','y',{d},{sd},{s}) ORDER BY t").fetchall()
+    actual = con.execute(f"SELECT t,w FROM _sarimax_diff_dyn("
+                         f"'offset_data','t','y',{d},{sd},{s}) ORDER BY t").fetchall()
+    assert actual == expected
+    con.execute("CREATE OR REPLACE TABLE offset_exog AS "
+                "SELECT t,1 AS j,y AS x FROM offset_data UNION ALL "
+                "SELECT t,2 AS j,-y AS x FROM offset_data")
+    exog = con.execute(f"SELECT t,j,x FROM _sarimax_diff_exog_dyn("
+                       f"'offset_exog',{d},{sd},{s}) ORDER BY j,t").fetchall()
+    assert exog == [(t,1,w) for t,w in expected] + [(t,2,-w) for t,w in expected]
+
+
+def test_public_residuals_use_fitted_differencing(con):
+    con.execute("CREATE OR REPLACE TABLE offset_obs AS SELECT t,"
+                "1e16+2*(t%7) AS y FROM range(1,41) q(t)")
+    con.execute("CREATE OR REPLACE TABLE offset_model AS SELECT * FROM "
+                "sarimax_fit('offset_obs','y',0,3,0,concentrate := true,"
+                "compute_bse := false,t_col := 't')")
+    actual = con.execute("SELECT t,v FROM sarimax_residuals("
+                         "'offset_model','offset_obs','y',t_col := 't') ORDER BY t").fetchall()
+    expected = con.execute("SELECT t,w FROM _sarimax_diff_nt("
+                           "'offset_obs','t','y',3,0,1) ORDER BY t").fetchall()
+    assert actual == expected
+
+
+@pytest.mark.parametrize("time_col", [None, "time'key"])
+def test_grid_sql_escapes_literal_names(con, time_col):
+    con.execute('CREATE OR REPLACE TABLE "sales\'2026" AS SELECT '
+                't AS "time\'key",sin(t) AS "units\'sold" FROM range(1,31) q(t)')
+    con.execute("CREATE OR REPLACE TABLE quoted_orders AS "
+                "SELECT 0 AS p,0 AS d,0 AS q,0 AS sp,0 AS sd,0 AS sq,1 AS s")
+    sql = con.execute("SELECT sarimax_grid_sql(?,?, 'quoted_orders',t_col := ?)",
+                      ["sales'2026", "units'sold", time_col]).fetchone()[0]
+    result = con.execute(sql).fetchall()
+    assert len(result) == 1
+    assert np.isfinite(result[0][7:10]).all()
+    assert result[0][10] == 1

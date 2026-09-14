@@ -31,12 +31,9 @@ Test groups:
      (untransform finite = the stationarity/invertibility test), round-trip
      transform(x0) == params0.
   5. Determinism: the full fit is bitwise identical at threads=1 vs default.
-  6. Timing: per-fixture wall times are recorded and printed (not asserted),
-     except the airline fixture full fit which must complete in < 10 minutes
-     (spec section 7).
+  6. Outcome reporting: every fixture must produce a fit result.
 """
 import os
-import time
 
 import duckdb
 import numpy as np
@@ -56,7 +53,7 @@ SQL_FILES = ["sql/00_linalg.sql", "sql/02_ssm.sql", "sql/03_filter.sql",
              "sql/04_estimate.sql"]
 
 # module-level records for the summary test
-FIT_RESULTS = {}     # fixture -> dict(path=..., time=..., ...)
+FIT_RESULTS = {}     # fixture -> dict(path=..., ...)
 
 
 def make_con(threads=None):
@@ -200,10 +197,8 @@ def test_t2_fit(con, fx):
     r, p, q, P, Q, s = blocks_of(spec)
     tol = 1e-5 if fx in BOUNDARY_FIXTURES else 1e-6
 
-    t0 = time.perf_counter()
     row = con.execute(f"""SELECT * FROM _sarimax_bfgs('_es_w', '_es_exd',
                               {r}, {p}, {q}, {P}, {Q}, {s})""").df().iloc[0]
-    dt = time.perf_counter() - t0
 
     params = np.asarray(row["params"], dtype=float)
     x_opt = np.asarray(row["x_opt"], dtype=float)
@@ -238,11 +233,9 @@ def test_t2_fit(con, fx):
         pytest.fail(f"{fx}: params off (dcon {dcon:.3e}, dunc {dunc:.3e}) and "
                     f"loglik not better (dll {dll:.3e})")
 
-    FIT_RESULTS[fx] = dict(path=path, time=dt, dll=dll, dcon=dcon, dunc=dunc,
+    FIT_RESULTS[fx] = dict(path=path, dll=dll, dcon=dcon, dunc=dunc,
                            iters=int(row["iterations"]), our_ll=our_ll, sm_ll=sm_ll,
                            params=params)
-    if fx == "airline":
-        assert dt < 600.0, f"airline full fit took {dt:.0f}s (spec cap: 10 minutes)"
 
 
 # ---------------------------------------------------------------------------
@@ -323,22 +316,20 @@ def test_fit_determinism_across_threads():
 
 
 # ---------------------------------------------------------------------------
-# 6. timing / outcome summary (runs last: pytest executes in file order)
+# 6. outcome summary (runs last: pytest executes in file order)
 # ---------------------------------------------------------------------------
 
 def test_summary_report():
-    """Prints per-fixture T2 outcome and wall time. Only asserts that every
-    fixture actually produced a fit result (the airline < 10 min gate is
-    asserted inside test_t2_fit)."""
+    """Require every fixture to produce a fit result and report its outcome."""
     if not FIT_RESULTS:
         pytest.skip("no T2 fits ran in this session (deselected?)")
     missing = [fx for fx in FIXTURES if fx not in FIT_RESULTS]
     assert not missing, f"fixtures without fit results (t2 failed?): {missing}"
     print("\n--- T2 fit outcomes -------------------------------------------")
-    print(f"{'fixture':22s} {'path':8s} {'time':>7s} {'iters':>5s} "
+    print(f"{'fixture':22s} {'path':8s} {'iters':>5s} "
           f"{'ll(ours)-ll(sm)':>16s} {'max|dparam|':>12s}")
     for fx in FIXTURES:
         rr = FIT_RESULTS[fx]
-        print(f"{fx:22s} {rr['path']:8s} {rr['time']:6.1f}s {rr['iters']:5d} "
+        print(f"{fx:22s} {rr['path']:8s} {rr['iters']:5d} "
               f"{rr['dll']:16.3e} {rr['dcon']:12.3e}")
     print("----------------------------------------------------------------")

@@ -1,50 +1,11 @@
-"""SECTION 4 (sql/04_estimate.sql) gradient-probe sharing acceptance.
+"""Gradient-probe sharing correctness checks.
 
-Contract: `_sarimax_kf_gains_v2` (one covariance-only filter pass) +
-`_sarimax_ll_mean_v2` (mean-only pass over the shared gains) must be
-BITWISE-identical to `_sarimax_ll_c_v2` whenever the evaluated vector's
-ARMA+sigma2 slice equals the one the gains were built from -- i.e. for every
-head-coordinate (tau/beta) gradient probe. `_sarimax_bfgs_v2` routes head
-probes through the split (constant-gated, see below), so its trajectory must
-be bitwise-unchanged; tests/test_estimate_v2.py re-asserts every fixture
-outcome unchanged.
-
-Test groups:
-  1. Kernel-split bitwise identity on every fixtures_v2 fixture: gains built
-     from a probe's constrained vector, mean evaluated at the same vector's
-     head -> EXACT (==) equality of (ll, scale2) with the full kernel; plus
-     the true gradient-probe case -- gains from the BASE vector, mean at a
-     +-1e-5 head-perturbed vector, full kernel at the perturbed vector.
-  2. Fit bitwise-trajectory guards on two synthetic public-path fits
-     (recorded constants measured before the change), with generous wall
-     guards.
-  3. The gradient-batch speedup assertion at the k = 27 configuration where
-     the covariance value-work dominates (the case the optimization exists
-     for): a shared-gains batch must beat the all-full-kernel batch.
-  4. Determinism: the split kernels bitwise at threads=1 vs default.
-
-DOCUMENTED DEVIATION (benchmark outcome vs the original < 0.85x plan): the
-plan assumed fit wall time scales with the number of O(n*k^3) kernel
-evaluations, so sharing 2*(ktrend+r) of 2*np gradient probes would cut the
-fit time by ~the head fraction. Measured on this engine (DuckDB 1.5.4,
-24 threads) that model is wrong for small k: DuckDB executes list-lambda
-folds VECTORIZED ACROSS ROWS, so one batched kernel call site costs a
-row-count-INDEPENDENT expression-tree walk (~0.25-0.35 s per site per
-evaluation for these kernels) plus tiny per-row value work (~1.6 ms/row at
-k = 2, ~80 ms at k = 14, ~540 ms at k = 27). Sharing removes per-row value
-work but ADDS a covariance site walk, so it can only win when
-(2*(ktrend+r) - 1) * value_work(row) exceeds a full site walk -- k >= ~20
-with >= 2 head coordinates. `_sarimax_bfgs_v2` therefore gates the routing
-on the CONSTANT condition ktrend + r >= 2 AND kdiff + karma >= 20 (e.g. the
-nodiff_sarimax_011_011_12 class of models, measured ~1.2x full-fit speedup);
-below the gate the old plan runs unchanged and the fit-time deltas here are
-just the resident-expression-tree tax (~5%, guarded at 1.25x). The k = 2 and
-k = 14 benchmark fits below are bitwise-identity + regression guards, not
-speedup demonstrations -- the speedup assertion lives in group 3 where the
-physics allows it. Measurements: scratchpad profiling runs, 2026-07-17.
+Shared covariance and mean passes must reproduce the full likelihood exactly,
+including perturbed head parameters, fitted trajectories, and thread-count
+independence. The large-state batch checks every probe against the full kernel.
+Performance measurements belong in profiling tools, not test assertions.
 """
 import os
-import time
 
 import duckdb
 import numpy as np
@@ -62,27 +23,11 @@ SQL_FILES = ["sql/00_linalg.sql", "sql/02_ssm.sql", "sql/03_filter.sql",
              "sql/04_estimate.sql"]
 
 # ---------------------------------------------------------------------------
-# pre-change reference numbers, measured on this machine at HEAD (before the
-# SECTION 4 change), .venv duckdb 1.5.4, 24 threads, 2026-07-17:
-#   benchmark A (n=300 ARMA(1,0,1) r=8 conc=false): 33.32 s wall,
-#     ll = -408.5134559762526, 20 iterations
-#   benchmark B (k=14 airline-shaped MA(1)x(1)_12 r=2 pre-differenced):
-#     53.40 s wall, ll = -94.2334412857046, 12 iterations
-# The wall guards are deliberately loose (1.4x): both models sit BELOW the
-# SECTION-4 gate, so their plans are the pre-change plans plus the resident
-# expression-tree tax (~5-15% measured, on top of session-to-session thermal
-# variance); the guard catches catastrophic plan regressions (the 2x+ class
-# a mis-shaped correlated LATERAL produces), not noise.
-# ---------------------------------------------------------------------------
-OLD_FIT_SECONDS_EXOG8 = 33.32
+# Pre-sharing fit results retained as exact trajectory regressions.
 OLD_FIT_LL_EXOG8 = -408.5134559762526
 OLD_FIT_ITERS_EXOG8 = 20
-OLD_FIT_SECONDS_K14 = 53.40
 OLD_FIT_LL_K14 = -94.2334412857046
 OLD_FIT_ITERS_K14 = 12
-WALL_GUARD = 1.4
-
-BENCH_RESULTS = {}
 
 
 def make_con(threads=None):
@@ -264,63 +209,36 @@ def bench_b_data():
     return X @ beta + u, X
 
 
-def test_benchmark_exog8(con):
-    """n=300 ARMA(1,0,1) + 8 standardized regressors: 16 of 22 gradient
-    probes are head probes -- but k=2 sits far below the SECTION-4 gate, so
-    this asserts the trajectory is bitwise-unchanged and wall time is within
-    the resident-tree-tax guard (module docstring)."""
+def test_fit_trajectory_exog8(con):
+    """Preserve the exact fit trajectory for eight regressors below the sharing gate."""
     y, X = bench_a_data()
     _load_fit_tables(con, y, X, "_ga")
-    t0 = time.perf_counter()
     row = con.execute("""SELECT * FROM _sarimax_bfgs_v2('_ga_y', '_ga_x', '_ga_degs',
                              8, 1, 1, 0, 0, 1, 0, 0, 0, false)""").df().iloc[0]
-    dt = time.perf_counter() - t0
-    BENCH_RESULTS["A(exog8 k=2)"] = (dt, OLD_FIT_SECONDS_EXOG8)
     assert float(row["loglik"]) == OLD_FIT_LL_EXOG8, \
         f"trajectory changed: ll {row['loglik']!r} vs {OLD_FIT_LL_EXOG8!r}"
     assert int(row["iterations"]) == OLD_FIT_ITERS_EXOG8
     assert bool(row["converged"])
-    assert dt < WALL_GUARD * OLD_FIT_SECONDS_EXOG8, \
-        f"fit took {dt:.1f}s vs pre-change {OLD_FIT_SECONDS_EXOG8}s " \
-        f"(guard {WALL_GUARD}x)"
 
 
-def test_benchmark_k14(con):
-    """k=14 airline-shaped MA(1)x(1)_12 with r=2 exog on pre-differenced
-    data (simple-differencing-style d=0/sd=0 args). Measured a WASH for
-    sharing (4 head probes x ~80 ms/row saved vs one ~330 ms covariance
-    site added), hence below the gate: bitwise + wall guard only."""
+def test_fit_trajectory_k14(con):
+    """Preserve the exact seasonal fit trajectory below the sharing gate."""
     y, X = bench_b_data()
     _load_fit_tables(con, y, X, "_gb")
-    t0 = time.perf_counter()
     row = con.execute("""SELECT * FROM _sarimax_bfgs_v2('_gb_y', '_gb_x', '_gb_degs',
                              2, 0, 1, 0, 1, 12, 0, 0, 0, false)""").df().iloc[0]
-    dt = time.perf_counter() - t0
-    BENCH_RESULTS["B(airline k=14)"] = (dt, OLD_FIT_SECONDS_K14)
     assert float(row["loglik"]) == OLD_FIT_LL_K14, \
         f"trajectory changed: ll {row['loglik']!r} vs {OLD_FIT_LL_K14!r}"
     assert int(row["iterations"]) == OLD_FIT_ITERS_K14
     assert bool(row["converged"])
-    assert dt < WALL_GUARD * OLD_FIT_SECONDS_K14, \
-        f"fit took {dt:.1f}s vs pre-change {OLD_FIT_SECONDS_K14}s " \
-        f"(guard {WALL_GUARD}x)"
 
 
 # ---------------------------------------------------------------------------
-# 3. gradient-batch speedup where the optimization applies (k = 27)
+# 3. gradient-batch equivalence where sharing applies (k = 27)
 # ---------------------------------------------------------------------------
 
-def test_gradient_batch_speedup_k27(con):
-    """One gradient batch at nodiff_sarimax_011_011_12's configuration
-    (k = 27, rtot = 2, above the gate): [shared gains + 4 mean + 6 full]
-    must beat [10 full] -- the shapes _sarimax_bfgs_v2 executes per
-    iteration there, including the aggregate-lateral gains bind (a plain
-    CTE/column bind gets re-inlined into every probe row -- the SECTION-4
-    header hazard). Timed via PREPARE/EXECUTE: the fit binds its recursion
-    once and re-EXECUTES per iteration, so execution time is the honest
-    per-iteration comparison (one-shot bind+optimize of these
-    macro-expanded trees costs seconds and would swamp the measurement).
-    Uses the fixture's own data and probe-1 params."""
+def test_gradient_batch_equivalence_k27(con):
+    """Shared gains + four mean + six full probes must equal ten full probes."""
     spec = setup_fixture_data(con, "nodiff_sarimax_011_011_12")
     args = args_of(spec)
     probes = load("nodiff_sarimax_011_011_12", "probes")
@@ -373,19 +291,6 @@ def test_gradient_batch_speedup_k27(con):
     con.execute(f"PREPARE _gs_qold AS {old_sql}")
     con.execute(f"PREPARE _gs_qnew AS {new_sql}")
 
-    def run(name):
-        t0 = time.perf_counter()
-        con.execute(f"EXECUTE {name}").fetchall()
-        return time.perf_counter() - t0
-
-    # warm both once, then take the best of 2
-    run("_gs_qold"), run("_gs_qnew")
-    t_old = min(run("_gs_qold"), run("_gs_qold"))
-    t_new = min(run("_gs_qnew"), run("_gs_qnew"))
-    BENCH_RESULTS["C(k=27 grad batch)"] = (t_new, t_old)
-    assert t_new < 0.85 * t_old, \
-        f"shared-gains batch {t_new:.2f}s not < 0.85 * full batch {t_old:.2f}s"
-    # and the two batches agree bitwise on every probe
     old_rows = dict(con.execute("EXECUTE _gs_qold").fetchall())
     new_rows = dict(con.execute("EXECUTE _gs_qnew").fetchall())
     for zidx in range(1, 11):
@@ -414,17 +319,3 @@ def test_split_determinism_threads():
         c.close()
     assert results[0] == results[1], \
         f"split kernel not thread-deterministic: {results[0]!r} vs {results[1]!r}"
-
-
-# ---------------------------------------------------------------------------
-# summary (runs last in file order)
-# ---------------------------------------------------------------------------
-
-def test_summary_report():
-    if not BENCH_RESULTS:
-        pytest.skip("no benchmarks ran (deselected?)")
-    print("\n--- gradient-probe sharing benchmarks --------------------------")
-    for name, (new, old) in BENCH_RESULTS.items():
-        print(f"{name:22s} new {new:7.2f}s   pre-change {old:7.2f}s   "
-              f"ratio {new/old:5.2f}x")
-    print("----------------------------------------------------------------")

@@ -2309,7 +2309,8 @@ _sarimax_bf2_it USING KEY (zkk) AS (
            za2.zx AS zx, za2.zfx AS zfx, za2.zg_new AS zgx,
            list_transform(range(1, za2.znp * za2.znp + 1), lambda zidx:
                CASE WHEN (zidx - 1) // za2.znp = (zidx - 1) % za2.znp THEN 1e0 ELSE 0e0 END) AS zhinv,
-           CASE WHEN za2.zg_new IS NULL
+           CASE WHEN NOT coalesce(isfinite(za2.zfx), false)
+                     OR za2.zg_new IS NULL
                      OR len(list_filter(za2.zg_new, lambda ze: ze IS NULL)) > 0 THEN 3
                 WHEN list_reduce(list_prepend(0e0, list_transform(za2.zg_new, lambda ze: abs(ze))),
                                  lambda za, zb: greatest(za, zb)) <= 1e-9 THEN 1

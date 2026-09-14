@@ -2,6 +2,10 @@
 
 Two independent validation paths, mirroring duckLM (spec section 11).
 
+Tests validate correctness and execution contracts, without elapsed-time or
+speedup thresholds. Use the profiling tools described in PERFORMANCE.md for
+performance measurements.
+
 ## 1. The pytest path (statsmodels-validated tiers)
 
 ```
@@ -15,7 +19,7 @@ python -m venv .venv && .venv/Scripts/pip install --upgrade -r tests/requirement
 | `test_prep.py` | `sql/01_prep.sql` | differencing bit-identical to np.diff, exact undiff round-trips, anchors, integration weights, validation failures |
 | `test_ssm.py` | `sql/02_ssm.sql` | system matrices == statsmodels `ssm` to 1e-14, incl. obs_intercept |
 | `test_transform.py` | `sql/04_estimate.sql` (transform) | == statsmodels `transform_params`/`untransform_params` to 1e-10; round-trip 1e-12 |
-| `test_filter.py` | `sql/03_filter.sql` | **Tier 1**: loglik abs<=1e-8/rel<=1e-10 and per-step (v, F) rel<=1e-9 at 26 probes x 11 fixtures; exog differential check; thread determinism; timing |
+| `test_filter.py` | `sql/03_filter.sql` | **Tier 1**: loglik abs<=1e-8/rel<=1e-10 and per-step (v, F) rel<=1e-9 at 26 probes x 11 fixtures; exog differential check; thread determinism |
 | `test_estimate.py` | `sql/04_estimate.sql` | **Tier 2**: fitted params abs<=1e-6 (1e-5 boundary fixtures), loglik rel<=1e-8, bse rel<=1e-3 |
 | `test_forecast.py` | `sql/05_forecast.sql` | **Tier 3**: forecasts both scales rel<=1e-6, standard errors rel<=1e-5, h=1..36 |
 | `test_assembly.py` | `sarimax_macros.sql` | shipped file == tools/build_macros.py output; loads clean; public macros callable |
