@@ -219,3 +219,40 @@ with signed zero and nonfinite inputs, mixed dense/sparse/shift/near-shift
 systems at one and four threads, v2 fixtures, live statsmodels comparisons,
 low-memory likelihoods, and assembly. The strengthened mixed-system test was
 also rerun after adding its near-shift case. No fixtures or tolerances changed.
+
+## Follow-up: combine covariance subtraction and process noise
+
+After `1c31131`, each v2 filter step still built separate lists for the outer
+product, the covariance subtraction, and the process-noise addition. The new
+projection computes each entry as `(TPT'[i,j] - tpz[i]*tpz[j]/F) + RQR[i,j]`
+directly, skipping the subtraction when the observation is missing. It retains
+the original floating-point operation order and the separate symmetrization
+pass. The full-trace and compact relational filters both use this projection;
+scalar fitting is unchanged.
+
+This removes two intermediate lists and one projection stage per recursive
+step. Two broader candidates were slower in the same workload and were not
+retained: carrying system matrices in the recursive state to remove a join,
+and combining symmetrization with the covariance update. The latter duplicated
+entry arithmetic despite reducing the number of list passes.
+
+Full-likelihood measurements against `1c31131`: DuckDB 1.5.5, one thread,
+500 observations, seven measured executions after one warmup. Runs were
+sequential in baseline → tuned → baseline order, with no competing tests.
+
+| State dimension | First baseline | Tuned | Repeated baseline | Reduction vs first baseline |
+|---|---:|---:|---:|---:|
+| 2 | 319 ms | 300 ms | 324 ms | 6% |
+| 14 | 373 ms | 355 ms | 390 ms | 5% |
+| 27 | 563 ms | 523 ms | 550 ms | 7% |
+
+The tuned medians were lower than both baseline runs in all cases. These are
+modest local improvements, not full-fit speedup estimates. Separate full-trace
+runs (three measured executions) changed from 319/362/536 ms to 293/350/484 ms
+for k2/k14/k27. All three likelihood results and all three complete traces
+matched the baseline exactly.
+
+Validation: the existing 80 targeted tests passed, covering transition
+arithmetic, v2 fixtures, mixed transition structures, missing observations,
+concentrated scale, live statsmodels checks, the low-memory relational path,
+and generated assembly. No fixtures or tolerances changed.

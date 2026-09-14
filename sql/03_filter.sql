@@ -572,43 +572,40 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                       THEN v * v / f ELSE 0e0 END AS ssq
     FROM (
         SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, ct, v, f, ta, tpz,
-               _sarimax_madd(psel, rqr) AS prqr
+               -- Preserve (TPT' - outer) + RQR arithmetic, but allocate only
+               -- the final list. Missing observations skip the subtraction.
+               list_transform(range(1, k * k + 1), lambda zidx:
+                   (CASE WHEN v IS NULL THEN tpt[zidx]
+                         ELSE tpt[zidx] - tpz[(zidx - 1) // k + 1]
+                              * tpz[(zidx - 1) % k + 1] / f END)
+                   + rqr[zidx]) AS prqr
         FROM (
-            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct, v, f,
-                   ta, tpz,
-                   CASE WHEN v IS NULL THEN tpt
-                        ELSE _sarimax_msub(tpt, outerm) END AS psel
+            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
+                   v, f, ta, tpz,
+                   CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
+                        ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt
             FROM (
-                SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
-                       v, f, ta, tpz,
-                       CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
-                            ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt,
-                       list_transform(range(1, k * k + 1), lambda zidx:
-                           tpz[(zidx - 1) // k + 1]
-                           * tpz[(zidx - 1) % k + 1] / f) AS outerm
+                SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
+                       tmat, tmat_t, tnz, rqr, ct, v, f, tp,
+                       list_transform(range(1, k + 1), lambda zi:
+                           tp[(zi - 1) * k + 1]) AS tpz,
+                       ta
                 FROM (
-                    SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
-                           tmat, tmat_t, tnz, rqr, ct, v, f, tp,
-                           list_transform(range(1, k + 1), lambda zi:
-                               tp[(zi - 1) * k + 1]) AS tpz,
-                           ta
-                    FROM (
-                        SELECT kf.probe_id, kf.t + 1 AS t, kf.cnt, kf.sumlogf,
-                               kf.ssq, s.k AS k, s.cidx, s.burn, s.tmat, s.tmat_t, s.tnz,
-                               s.rqr,
-                               o.ct AS ct,
-                               o.yd - kf.a[1] AS v,
-                               kf.p[1] AS f,
-                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.p, s.k, s.k, is_shift := use_shift) END AS tp,
-                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.a, s.k, 1, is_shift := use_shift) END AS ta
-                        FROM _sarimax_kf2 kf
-                        JOIN _sarimax_sparse_sys s
-                          ON s.probe_id = kf.probe_id
-                        JOIN _sarimax_step_obs o
-                          ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
-                    )
+                    SELECT kf.probe_id, kf.t + 1 AS t, kf.cnt, kf.sumlogf,
+                           kf.ssq, s.k AS k, s.cidx, s.burn, s.tmat, s.tmat_t, s.tnz,
+                           s.rqr,
+                           o.ct AS ct,
+                           o.yd - kf.a[1] AS v,
+                           kf.p[1] AS f,
+                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k)
+                                ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.p, s.k, s.k, is_shift := use_shift) END AS tp,
+                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1)
+                                ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.a, s.k, 1, is_shift := use_shift) END AS ta
+                    FROM _sarimax_kf2 kf
+                    JOIN _sarimax_sparse_sys s
+                      ON s.probe_id = kf.probe_id
+                    JOIN _sarimax_step_obs o
+                      ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
                 )
             )
         )
@@ -684,43 +681,40 @@ WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
                       THEN v * v / f ELSE 0e0 END AS ssq
     FROM (
         SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, ct, v, f, ta, tpz,
-               _sarimax_madd(psel, rqr) AS prqr
+               -- Preserve (TPT' - outer) + RQR arithmetic, but allocate only
+               -- the final list. Missing observations skip the subtraction.
+               list_transform(range(1, k * k + 1), lambda zidx:
+                   (CASE WHEN v IS NULL THEN tpt[zidx]
+                         ELSE tpt[zidx] - tpz[(zidx - 1) // k + 1]
+                              * tpz[(zidx - 1) % k + 1] / f END)
+                   + rqr[zidx]) AS prqr
         FROM (
-            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct, v, f,
-                   ta, tpz,
-                   CASE WHEN v IS NULL THEN tpt
-                        ELSE _sarimax_msub(tpt, outerm) END AS psel
+            SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
+                   v, f, ta, tpz,
+                   CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
+                        ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt
             FROM (
-                SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
-                       v, f, ta, tpz,
-                       CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
-                            ELSE _sarimax_transition_right(tmat, tnz, tp, k, is_shift := use_shift) END AS tpt,
-                       list_transform(range(1, k * k + 1), lambda zidx:
-                           tpz[(zidx - 1) // k + 1]
-                           * tpz[(zidx - 1) % k + 1] / f) AS outerm
+                SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
+                       tmat, tmat_t, tnz, rqr, ct, v, f, tp,
+                       list_transform(range(1, k + 1), lambda zi:
+                           tp[(zi - 1) * k + 1]) AS tpz,
+                       ta
                 FROM (
-                    SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
-                           tmat, tmat_t, tnz, rqr, ct, v, f, tp,
-                           list_transform(range(1, k + 1), lambda zi:
-                               tp[(zi - 1) * k + 1]) AS tpz,
-                           ta
-                    FROM (
-                        SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.cnt,
-                               kfs.sumlogf, kfs.ssq, s.k AS k, s.cidx, s.burn,
-                               s.tmat, s.tmat_t, s.tnz, s.rqr,
-                               o.ct AS ct,
-                               o.yd - kfs.a[1] AS v,
-                               kfs.p[1] AS f,
-                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.p, s.k, s.k, is_shift := use_shift) END AS tp,
-                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1)
-                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.a, s.k, 1, is_shift := use_shift) END AS ta
-                        FROM _sarimax_kfs2 kfs
-                        JOIN _sarimax_sparse_sys s
-                          ON s.probe_id = kfs.probe_id
-                        JOIN _sarimax_step_obs o
-                          ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
-                    )
+                    SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.cnt,
+                           kfs.sumlogf, kfs.ssq, s.k AS k, s.cidx, s.burn,
+                           s.tmat, s.tmat_t, s.tnz, s.rqr,
+                           o.ct AS ct,
+                           o.yd - kfs.a[1] AS v,
+                           kfs.p[1] AS f,
+                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k)
+                                ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.p, s.k, s.k, is_shift := use_shift) END AS tp,
+                           CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1)
+                                ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.a, s.k, 1, is_shift := use_shift) END AS ta
+                    FROM _sarimax_kfs2 kfs
+                    JOIN _sarimax_sparse_sys s
+                      ON s.probe_id = kfs.probe_id
+                    JOIN _sarimax_step_obs o
+                      ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
                 )
             )
         )
