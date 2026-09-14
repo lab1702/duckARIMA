@@ -128,7 +128,7 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params(c, r, p, q, bigp, bigq) AS (
 -- passed as materialized values/columns, never as expressions (trap: textual
 -- macro expansion re-evaluates argument expressions per lambda element).
 --
--- NEW TRAP DISCOVERED HERE (DuckDB 1.5.4): inside a correlated LATERAL
+-- NEW TRAP DISCOVERED HERE (DuckDB): inside a correlated LATERAL
 -- subquery, a lambda body may reference either correlated outer columns or
 -- local columns -- but not resolve local ones once any correlated column is
 -- referenced anywhere in the lambda ("Referenced table ... not found").
@@ -936,7 +936,7 @@ CREATE OR REPLACE MACRO _sarimax_bse(params, wlist, xmat, r, p, q, bigp, bigq, s
 WITH _sarimax_bse_in0 AS (
     -- bind the raw arguments to columns FIRST (plain projections only), so
     -- callers may pass scalar subqueries: a subquery argument that reached a
-    -- lambda body would be a binder error in DuckDB 1.5.4
+    -- lambda body would be a binder error in DuckDB
     SELECT params AS zc, wlist AS zwl, xmat AS zxm,
            (r + p + q + bigp + bigq + 1)::BIGINT AS znp
 ),

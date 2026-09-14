@@ -1,5 +1,5 @@
 -- ============================================================================
--- duckARIMA Layer 0: relational linear algebra as pure DuckDB (>= 1.5.4) SQL
+-- duckARIMA Layer 0: relational linear algebra as pure DuckDB SQL
 -- macros. No extensions, no UDFs. Spec: sarima-duckdb-sql-spec.md sections
 -- 4.1, 4.2, 4.3, 5.0, 6.
 --

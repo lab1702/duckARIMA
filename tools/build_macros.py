@@ -23,7 +23,7 @@ LAYERS = [
 HEADER = """\
 -- ============================================================================
 -- duckARIMA: seasonal ARIMA with exogenous regressors (SARIMAX) as pure
--- DuckDB (>= 1.5.4) SQL table macros. No extensions, no driver required.
+-- DuckDB SQL table macros. No extensions, no driver required.
 --
 -- Load once per session:      .read sarimax_macros.sql
 -- Public entry points:        sarimax_fit, sarimax_forecast, sarimax_summary,

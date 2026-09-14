@@ -2,7 +2,7 @@
 
 Seasonal ARIMA with exogenous regressors (SARIMAX) — estimation, inference,
 and forecasting — as **pure DuckDB SQL table macros**. No extensions, no
-UDFs, no driver required: everything runs inside a stock DuckDB ≥ 1.5.4
+UDFs, no driver required: everything runs inside a stock DuckDB
 session, from the CLI or any client.
 
 Validated against statsmodels' `SARIMAX` on committed golden fixtures at

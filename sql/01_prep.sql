@@ -1,6 +1,6 @@
 -- ============================================================================
 -- duckARIMA Layer 1 -- series preparation (spec sections 4.1, 4.2, 5.1, 5.5).
--- Pure DuckDB (>= 1.5.4) SQL macros; load with:  .read sql/01_prep.sql
+-- Pure DuckDB SQL macros; load with:  .read sql/01_prep.sql
 -- No extensions, no UDFs. All lambdas are Python-style (`lambda x: ...`) and
 -- the library is clean under  SET lambda_syntax = 'DISABLE_SINGLE_ARROW'.
 --

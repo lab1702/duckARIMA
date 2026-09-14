@@ -1,6 +1,6 @@
 -- ============================================================================
 -- duckARIMA: seasonal ARIMA with exogenous regressors (SARIMAX) as pure
--- DuckDB (>= 1.5.4) SQL table macros. No extensions, no driver required.
+-- DuckDB SQL table macros. No extensions, no driver required.
 --
 -- Load once per session:      .read sarimax_macros.sql
 -- Public entry points:        sarimax_fit, sarimax_forecast, sarimax_summary,
@@ -21,7 +21,7 @@
 -- ================== sql/00_linalg.sql ==================
 
 -- ============================================================================
--- duckARIMA Layer 0: relational linear algebra as pure DuckDB (>= 1.5.4) SQL
+-- duckARIMA Layer 0: relational linear algebra as pure DuckDB SQL
 -- macros. No extensions, no UDFs. Spec: sarima-duckdb-sql-spec.md sections
 -- 4.1, 4.2, 4.3, 5.0, 6.
 --
@@ -563,7 +563,7 @@ CREATE OR REPLACE MACRO _sarimax_transition_right(tm, nz, a, k, is_shift := fals
 
 -- ============================================================================
 -- duckARIMA Layer 1 -- series preparation (spec sections 4.1, 4.2, 5.1, 5.5).
--- Pure DuckDB (>= 1.5.4) SQL macros; load with:  .read sql/01_prep.sql
+-- Pure DuckDB SQL macros; load with:  .read sql/01_prep.sql
 -- No extensions, no UDFs. All lambdas are Python-style (`lambda x: ...`) and
 -- the library is clean under  SET lambda_syntax = 'DISABLE_SINGLE_ARROW'.
 --
@@ -2599,7 +2599,7 @@ CREATE OR REPLACE MACRO _sarimax_untransform_params(c, r, p, q, bigp, bigq) AS (
 -- passed as materialized values/columns, never as expressions (trap: textual
 -- macro expansion re-evaluates argument expressions per lambda element).
 --
--- NEW TRAP DISCOVERED HERE (DuckDB 1.5.4): inside a correlated LATERAL
+-- NEW TRAP DISCOVERED HERE (DuckDB): inside a correlated LATERAL
 -- subquery, a lambda body may reference either correlated outer columns or
 -- local columns -- but not resolve local ones once any correlated column is
 -- referenced anywhere in the lambda ("Referenced table ... not found").
@@ -3407,7 +3407,7 @@ CREATE OR REPLACE MACRO _sarimax_bse(params, wlist, xmat, r, p, q, bigp, bigq, s
 WITH _sarimax_bse_in0 AS (
     -- bind the raw arguments to columns FIRST (plain projections only), so
     -- callers may pass scalar subqueries: a subquery argument that reached a
-    -- lambda body would be a binder error in DuckDB 1.5.4
+    -- lambda body would be a binder error in DuckDB
     SELECT params AS zc, wlist AS zwl, xmat AS zxm,
            (r + p + q + bigp + bigq + 1)::BIGINT AS znp
 ),
