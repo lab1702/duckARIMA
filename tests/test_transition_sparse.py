@@ -57,3 +57,35 @@ def test_scalar_dispatch_does_not_execute_relational_branch(con, unconstrained):
     assert got['scale2'] == 1
     with pytest.raises(duckdb.Error, match='relational branch executed'):
         con.execute(query.format(mode='true')).fetchall()
+
+
+@pytest.mark.parametrize('threads', [1, 4])
+def test_relational_dispatch_matches_dense_for_mixed_systems(con, threads):
+    """Both recursive branches must retain every probe and its exact trace/state."""
+    previous_threads = con.execute("SELECT current_setting('threads')").fetchone()[0]
+    try:
+        con.execute(f'SET threads = {threads}')
+        con.execute("CREATE OR REPLACE TABLE mixed_probes AS "
+                    "SELECT 1 AS probe_id, [0.3,0.2,1.0]::DOUBLE[] AS params")
+        con.execute("""
+            CREATE OR REPLACE TABLE mixed_sys AS
+            SELECT * FROM _sarimax_systems_v2('mixed_probes',0,1,1,0,0,1,0,0,0,false)
+            UNION ALL
+            SELECT * REPLACE (2 AS probe_id) FROM
+                _sarimax_systems_v2('mixed_probes',0,0,1,0,1,12,1,1,0,false)
+        """)
+        con.execute("""
+            CREATE OR REPLACE TABLE mixed_obs AS
+            SELECT probe_id, i AS t,
+                   CASE WHEN i % 7 = 0 THEN NULL ELSE sin(i::DOUBLE) END AS yd,
+                   0e0 AS ct
+            FROM mixed_sys CROSS JOIN range(1, 31) r(i)
+        """)
+        for name in ['_sarimax_kfilter', '_sarimax_kfilter_state']:
+            expected = con.execute(f"SELECT * FROM {name}_impl_v2("
+                                   "'mixed_obs','mixed_sys',false) ORDER BY ALL").fetchall()
+            actual = con.execute(f"SELECT * FROM {name}_v2("
+                                 "'mixed_obs','mixed_sys') ORDER BY ALL").fetchall()
+            assert actual == expected
+    finally:
+        con.execute(f'SET threads = {previous_threads}')

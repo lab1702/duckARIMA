@@ -256,3 +256,33 @@ def test_public_out_of_core_fit_can_skip_bse(con):
     assert sigma2 > 0
     assert bse is None
     assert converged == 1.0
+
+
+@pytest.mark.parametrize('concentrate', [False, True])
+def test_sparse_seasonal_relational_likelihood_matches_scalar(con, concentrate):
+    """27-state sparse products preserve likelihood with diffuse/missing data."""
+    con.execute("""
+        CREATE OR REPLACE TABLE _ooc_sparse_y AS
+        SELECT i::BIGINT AS t,
+               CASE WHEN i % 19 = 0 THEN NULL ELSE sin(i::DOUBLE) END AS y
+        FROM range(1, 61) r(i)
+    """)
+    con.execute("""
+        CREATE OR REPLACE TABLE _ooc_sparse_x AS
+        SELECT t, 1::BIGINT AS j, cos(t::DOUBLE) AS x FROM _ooc_sparse_y
+    """)
+    con.execute("CREATE OR REPLACE TABLE _ooc_sparse_degs AS SELECT 1 AS idx, 0 AS degree")
+    params = '[0.01,0.2,0.3,0.2]' if concentrate else '[0.01,0.2,0.3,0.2,0.8]'
+    args = f'1,0,1,0,1,12,1,1,1,{str(concentrate).lower()}'
+    scalar, relational = con.execute(f"""
+        WITH packed AS MATERIALIZED (
+            SELECT list(y ORDER BY t) AS yl,
+                   list([cos(t::DOUBLE)] ORDER BY t) AS xm
+            FROM _ooc_sparse_y
+        )
+        SELECT _sarimax_ll_c_v2({params}::DOUBLE[], yl, xm, [0]::BIGINT[], {args}),
+               _sarimax_ll_c_ooc_v2({params}::DOUBLE[],
+                   '_ooc_sparse_y', '_ooc_sparse_x', '_ooc_sparse_degs', {args})
+        FROM packed
+    """).fetchone()
+    assert relational == scalar

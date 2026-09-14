@@ -465,3 +465,38 @@ SELECT ze.i AS i, (ze.j - zn.n)::INT AS j, ze.v AS v,
 FROM _sarimax_rs_elim ze, _sarimax_rs_n zn,
      (SELECT min(pivmin) AS pivmin FROM _sarimax_rs_elim) zpm
 WHERE ze.j > zn.n;
+
+-- Transition matrices are sparse even when the integrated state is large.
+-- Cache each row's nonzero columns once; keep their original ascending order
+-- so finite products are accumulated in the same order as the dense kernel.
+CREATE OR REPLACE MACRO _sarimax_transition_rows(tm, k) AS (
+    CASE WHEN len(list_filter(tm, lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
+         THEN NULL
+    ELSE list_transform(range(1, k + 1), lambda zi:
+        list_filter(range(1, k + 1), lambda zj: tm[(zi - 1) * k + zj] <> 0e0)) END
+);
+
+CREATE OR REPLACE MACRO _sarimax_transition_left(tm, nz, b, k, n) AS (
+    CASE WHEN k < 20 OR nz IS NULL OR len(list_filter(b,
+             lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
+         THEN _sarimax_mmul(tm, b, k, k, n)
+    ELSE list_transform(range(1, k * n + 1), lambda zi:
+        list_reduce(list_prepend(0e0,
+            list_transform(nz[(zi - 1) // n + 1], lambda zj:
+                tm[((zi - 1) // n) * k + zj] * b[(zj - 1) * n + (zi - 1) % n + 1])),
+            lambda za, zb: za + zb)) END
+);
+
+-- a * transpose(tm), using the same cached rows of tm. Bind the dense
+-- fallback transpose once: passing it inline to _mmul repeats it per product.
+CREATE OR REPLACE MACRO _sarimax_transition_right(tm, nz, a, k) AS (
+    CASE WHEN k < 20 OR nz IS NULL OR len(list_filter(a,
+             lambda zv: zv IS NULL OR NOT isfinite(zv))) > 0
+         THEN (list_transform([_sarimax_mtrans(tm, k, k)], lambda ztt:
+             _sarimax_mmul(a, ztt, k, k, k)))[1]
+    ELSE list_transform(range(1, k * k + 1), lambda zi:
+        list_reduce(list_prepend(0e0,
+            list_transform(nz[(zi - 1) % k + 1], lambda zj:
+                a[((zi - 1) // k) * k + zj] * tm[((zi - 1) % k) * k + zj])),
+            lambda za, zb: za + zb)) END
+);

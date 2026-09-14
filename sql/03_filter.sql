@@ -529,8 +529,13 @@ LEFT JOIN _sarimax_oa2o_int di
 --   f <= 0, poisoning the accumulator), ssq += v^2/f.
 -- The intercept c applied at step t is ct at row t + 1 when kdiff > 0 (the
 -- shifted-basis timing; 0 beyond the sample) and ct at row t when kdiff = 0.
-CREATE OR REPLACE MACRO _sarimax_kfilter_v2(obs_tbl, sys_tbl) AS TABLE
-WITH RECURSIVE _sarimax_kf2 USING KEY (probe_id, t) AS (
+CREATE OR REPLACE MACRO _sarimax_kfilter_impl_v2(obs_tbl, sys_tbl, use_sparse) AS TABLE
+WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
+    -- Cache transition support once per system, outside the time recursion.
+    SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
+           ELSE NULL::BIGINT[][] END AS tnz
+    FROM query_table(sys_tbl)
+), _sarimax_kf2 USING KEY (probe_id, t) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,
            s.a1f AS a,
@@ -540,7 +545,7 @@ WITH RECURSIVE _sarimax_kf2 USING KEY (probe_id, t) AS (
            0::BIGINT AS cnt,
            0e0 AS sumlogf,
            0e0 AS ssq
-    FROM query_table(sys_tbl) s
+    FROM _sarimax_sparse_sys s
     UNION ALL
     SELECT probe_id, t,
            list_transform(range(1, k + 1), lambda zi:
@@ -567,27 +572,30 @@ WITH RECURSIVE _sarimax_kf2 USING KEY (probe_id, t) AS (
             FROM (
                 SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
                        v, f, ta, tpz,
-                       _sarimax_mmul(tp, tmat_t, k, k, k) AS tpt,
+                       CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
+                            ELSE _sarimax_transition_right(tmat, tnz, tp, k) END AS tpt,
                        list_transform(range(1, k * k + 1), lambda zidx:
                            tpz[(zidx - 1) // k + 1]
                            * tpz[(zidx - 1) % k + 1] / f) AS outerm
                 FROM (
                     SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
-                           tmat_t, rqr, ct, v, f, tp,
+                           tmat, tmat_t, tnz, rqr, ct, v, f, tp,
                            list_transform(range(1, k + 1), lambda zi:
                                tp[(zi - 1) * k + 1]) AS tpz,
                            ta
                     FROM (
                         SELECT kf.probe_id, kf.t + 1 AS t, kf.cnt, kf.sumlogf,
-                               kf.ssq, s.k AS k, s.cidx, s.burn, s.tmat_t,
+                               kf.ssq, s.k AS k, s.cidx, s.burn, s.tmat, s.tmat_t, s.tnz,
                                s.rqr,
                                coalesce(oc.ct, 0e0) AS ct,
                                o.yd - kf.a[1] AS v,
                                kf.p[1] AS f,
-                               _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k) AS tp,
-                               _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1) AS ta
+                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.p, s.k, s.k, s.k)
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.p, s.k, s.k) END AS tp,
+                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kf.a, s.k, s.k, 1)
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kf.a, s.k, 1) END AS ta
                         FROM _sarimax_kf2 kf
-                        JOIN query_table(sys_tbl) s
+                        JOIN _sarimax_sparse_sys s
                           ON s.probe_id = kf.probe_id
                         JOIN query_table(obs_tbl) o
                           ON o.probe_id = kf.probe_id AND o.t = kf.t + 1
@@ -605,12 +613,29 @@ SELECT probe_id, t, v, f, cnt, sumlogf, ssq
 FROM _sarimax_kf2
 WHERE t >= 1;
 
+-- Separate recursive plans let DuckDB discard sparse expression trees entirely
+-- for small systems. Filtering the seeds also supports mixed state dimensions.
+CREATE OR REPLACE MACRO _sarimax_kfilter_v2(obs_tbl, sys_tbl) AS TABLE
+WITH _sarimax_dense_input AS MATERIALIZED (
+    SELECT * FROM query_table(sys_tbl) WHERE k < 20
+), _sarimax_sparse_input AS MATERIALIZED (
+    SELECT * FROM query_table(sys_tbl) WHERE k >= 20
+)
+SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_dense_input', false)
+UNION ALL
+SELECT * FROM _sarimax_kfilter_impl_v2(obs_tbl, '_sarimax_sparse_input', true);
+
 -- Compact variant (USING KEY probe_id: each iteration replaces the row, only
 -- the final state survives). Same arithmetic as _sarimax_kfilter_v2. Returns
 -- (probe_id, n_eff, a, p, cnt, sumlogf, ssq); note the shifted-basis caveat
 -- above about the missing c_{n+1} term in the final a when kdiff > 0.
-CREATE OR REPLACE MACRO _sarimax_kfilter_state_v2(obs_tbl, sys_tbl) AS TABLE
-WITH RECURSIVE _sarimax_kfs2 USING KEY (probe_id) AS (
+CREATE OR REPLACE MACRO _sarimax_kfilter_state_impl_v2(obs_tbl, sys_tbl, use_sparse) AS TABLE
+WITH RECURSIVE _sarimax_sparse_sys AS MATERIALIZED (
+    -- Cache transition support once per system, outside the time recursion.
+    SELECT *, CASE WHEN use_sparse THEN _sarimax_transition_rows(tmat, k)
+           ELSE NULL::BIGINT[][] END AS tnz
+    FROM query_table(sys_tbl)
+), _sarimax_kfs2 USING KEY (probe_id) AS (
     SELECT s.probe_id,
            0::BIGINT AS t,
            s.a1f AS a,
@@ -618,7 +643,7 @@ WITH RECURSIVE _sarimax_kfs2 USING KEY (probe_id) AS (
            0::BIGINT AS cnt,
            0e0 AS sumlogf,
            0e0 AS ssq
-    FROM query_table(sys_tbl) s
+    FROM _sarimax_sparse_sys s
     UNION ALL
     SELECT probe_id, t,
            list_transform(range(1, k + 1), lambda zi:
@@ -644,27 +669,30 @@ WITH RECURSIVE _sarimax_kfs2 USING KEY (probe_id) AS (
             FROM (
                 SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn, rqr, ct,
                        v, f, ta, tpz,
-                       _sarimax_mmul(tp, tmat_t, k, k, k) AS tpt,
+                       CASE WHEN NOT use_sparse THEN _sarimax_mmul(tp, tmat_t, k, k, k)
+                            ELSE _sarimax_transition_right(tmat, tnz, tp, k) END AS tpt,
                        list_transform(range(1, k * k + 1), lambda zidx:
                            tpz[(zidx - 1) // k + 1]
                            * tpz[(zidx - 1) % k + 1] / f) AS outerm
                 FROM (
                     SELECT probe_id, t, cnt, sumlogf, ssq, k, cidx, burn,
-                           tmat_t, rqr, ct, v, f, tp,
+                           tmat, tmat_t, tnz, rqr, ct, v, f, tp,
                            list_transform(range(1, k + 1), lambda zi:
                                tp[(zi - 1) * k + 1]) AS tpz,
                            ta
                     FROM (
                         SELECT kfs.probe_id, kfs.t + 1 AS t, kfs.cnt,
                                kfs.sumlogf, kfs.ssq, s.k AS k, s.cidx, s.burn,
-                               s.tmat_t, s.rqr,
+                               s.tmat, s.tmat_t, s.tnz, s.rqr,
                                coalesce(oc.ct, 0e0) AS ct,
                                o.yd - kfs.a[1] AS v,
                                kfs.p[1] AS f,
-                               _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k) AS tp,
-                               _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1) AS ta
+                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.p, s.k, s.k, s.k)
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.p, s.k, s.k) END AS tp,
+                               CASE WHEN NOT use_sparse THEN _sarimax_mmul(s.tmat, kfs.a, s.k, s.k, 1)
+                                    ELSE _sarimax_transition_left(s.tmat, s.tnz, kfs.a, s.k, 1) END AS ta
                         FROM _sarimax_kfs2 kfs
-                        JOIN query_table(sys_tbl) s
+                        JOIN _sarimax_sparse_sys s
                           ON s.probe_id = kfs.probe_id
                         JOIN query_table(obs_tbl) o
                           ON o.probe_id = kfs.probe_id AND o.t = kfs.t + 1
@@ -680,6 +708,18 @@ WITH RECURSIVE _sarimax_kfs2 USING KEY (probe_id) AS (
 )
 SELECT probe_id, t AS n_eff, a, p, cnt, sumlogf, ssq
 FROM _sarimax_kfs2;
+
+-- Separate recursive plans let DuckDB discard sparse expression trees entirely
+-- for small systems. Filtering the seeds also supports mixed state dimensions.
+CREATE OR REPLACE MACRO _sarimax_kfilter_state_v2(obs_tbl, sys_tbl) AS TABLE
+WITH _sarimax_dense_input AS MATERIALIZED (
+    SELECT * FROM query_table(sys_tbl) WHERE k < 20
+), _sarimax_sparse_input AS MATERIALIZED (
+    SELECT * FROM query_table(sys_tbl) WHERE k >= 20
+)
+SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_dense_input', false)
+UNION ALL
+SELECT * FROM _sarimax_kfilter_state_impl_v2(obs_tbl, '_sarimax_sparse_input', true);
 
 -- Loglikelihood per probe. conc: 0 = sigma2 lives in RQR (standard formula),
 -- 1 = concentrated scale (filter ran at sigma2 = 1; scale2 = ssq/cnt).

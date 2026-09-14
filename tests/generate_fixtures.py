@@ -1,8 +1,9 @@
 """duckARIMA golden-fixture generator (spec section 8).
 
-Runs OFFLINE, ONCE, against pinned statsmodels/NumPy versions (tests/requirements.txt)
-and emits Parquet files per fixture under tests/fixtures/<name>/. Parquet (not CSV) so
-doubles round-trip losslessly as binary IEEE 754.
+Run deliberately with the installed statsmodels/NumPy versions (record them when
+regenerating; see tests/README.md). Emits Parquet files per fixture under
+tests/fixtures/<name>/. Parquet (not CSV) so doubles round-trip losslessly
+as binary IEEE 754.
 
 Pinned model options for every fixture (spec section 8):
     simple_differencing=True, enforce_stationarity=True, enforce_invertibility=True,

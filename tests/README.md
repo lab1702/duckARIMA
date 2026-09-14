@@ -5,7 +5,7 @@ Two independent validation paths, mirroring duckLM (spec section 11).
 ## 1. The pytest path (statsmodels-validated tiers)
 
 ```
-python -m venv .venv && .venv/Scripts/pip install -r tests/requirements.txt
+python -m venv .venv && .venv/Scripts/pip install --upgrade -r tests/requirements.txt
 .venv/Scripts/python -m pytest tests/ -q
 ```
 
@@ -38,15 +38,16 @@ intervals). Guards the "no driver required" claim.
 ## Fixtures
 
 `tests/fixtures/<name>/*.parquet` are golden references generated ONCE by
-`tests/generate_fixtures.py` against the pinned environment in
-`tests/requirements.txt` (statsmodels 0.14.6, NumPy 2.5.1). Parquet, not CSV,
-so doubles round-trip losslessly. Schemas are documented in the generator's
+`tests/generate_fixtures.py` using statsmodels 0.14.6 and NumPy 2.5.1.
+These versions describe fixture provenance; `tests/requirements.txt` is
+unconstrained so installations with `--upgrade` use the latest stable releases.
+Parquet, not CSV, so doubles round-trip losslessly. Schemas are documented in the generator's
 docstring.
 
 `tests/fixtures_v2/<name>/*.parquet` are the v2-feature references
 (concentrated scale, trend terms, missing values, simple_differencing=False;
 6 fixtures incl. the `kitchen_sink` combination), generated ONCE by
-`tests/generate_fixtures_v2.py` under the same pinned environment and
+`tests/generate_fixtures_v2.py` under the same original reference environment and
 regeneration policy. The v1 fixtures were not touched. Extra schema vs v1:
 spec gains (burn, sdiff, conc, ktrend); a `trend.parquet` lists polynomial
 degrees; `ssm.parquet` adds state_intercept / a1 / P1 rows; `fitted_meta`
@@ -74,3 +75,10 @@ regenerate deliberately. Regenerations so far:
 
 Both regenerations predate the first tagged release; the fixtures have been
 stable since.
+
+## Performance profiling
+
+`python tools/profile_filter.py --output scratch/profile --repeats 7` captures
+JSON `EXPLAIN ANALYZE` plans and separately times prepared relational filters
+at state dimensions 2, 14, and 27. See [PERFORMANCE.md](../PERFORMANCE.md) for
+before/after measurements, interpretation, and comparison commands.
