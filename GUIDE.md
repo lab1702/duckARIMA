@@ -298,7 +298,9 @@ CREATE TABLE model AS SELECT * FROM sarimax_fit(
     compute_bse := false);
 ```
 
-The out-of-core initializer uses zero trend/exog/ARMA coefficients and the
+For a constant-mean white-noise model, the out-of-core initializer uses the
+analytic sample mean and population variance, computed with scalar aggregates.
+For other models it uses zero trend/exog/ARMA coefficients and the
 spill-safe scalar second moment for sigma2, rather than the default
 Hannan–Rissanen initializer's ordered folds. The relational system builder
 also uses its Lyapunov solve rather than the fast scalar objective's fixed

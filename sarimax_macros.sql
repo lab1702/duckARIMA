@@ -4039,18 +4039,22 @@ CREATE OR REPLACE MACRO _sarimax_ll_x_eval_v2(xunc, ylist, xmat, degs,
 -- Spill-safe, deliberately conservative starting point.  The high-throughput
 -- path keeps the Hannan-Rissanen initializer below; its many ordered LIST
 -- folds are inappropriate under a hard memory budget.  Zero trend/exog/ARMA
--- coefficients are stationary and invertible, and the only data aggregate is
--- a streaming scalar second moment.  For raw integrated levels this can be a
+-- coefficients are stationary and invertible. A constant-mean white-noise
+-- model instead starts at its analytic mean and variance; all data aggregates
+-- are streaming scalars.  For raw integrated levels this can be a
 -- conservative overestimate of innovation variance, but it stays bounded.
 CREATE OR REPLACE MACRO _sarimax_start_params_ooc_v2(y_tbl,
                                                      r, p, q, bigp, bigq,
                                                      s, d, sd, ktrend,
-                                                     conc) AS TABLE
+                                                     conc, constant_mean := false) AS TABLE
 WITH _sarimax_spo_stats AS (
     SELECT count(*)::BIGINT AS zn,
            count(y) FILTER (
                WHERE t > _sarimax_kdiff(d, sd, s))::BIGINT AS zny,
-           avg(y * y) FILTER (WHERE y IS NOT NULL) AS zm2
+           CASE WHEN constant_mean THEN var_pop(y)
+                ELSE avg(y * y) END AS zm2,
+           CASE WHEN constant_mean THEN avg(y) ELSE 0e0 END AS zmean,
+           constant_mean AS zconstant
     FROM query_table(y_tbl)
 ),
 _sarimax_spo_sig AS (
@@ -4080,13 +4084,14 @@ _sarimax_spo_sig AS (
              WHEN zm2 IS NOT NULL AND isfinite(zm2) AND zm2 > 0e0
                THEN zm2
              ELSE 1e0
-           END AS zsig2
+           END AS zsig2, zmean, zconstant
     FROM _sarimax_spo_stats
 ),
 _sarimax_spo_z AS (
     SELECT list_transform(
                range(1, ktrend + r + p + q + bigp + bigq + 1),
-               lambda zi: 0e0) AS zzero,
+               lambda zi: CASE WHEN zconstant AND zi = 1
+                               THEN zmean ELSE 0e0 END) AS zzero,
            zsig2
     FROM _sarimax_spo_sig
 )
@@ -4917,7 +4922,11 @@ _sarimax_bf2_pc AS (
         UNION ALL
         SELECT x0, params0
         FROM _sarimax_start_params_ooc_v2(y_tbl, r, p, q, bigp, bigq,
-                                          s, d, sd, ktrend, conc)
+                                          s, d, sd, ktrend, conc,
+                                          constant_mean := r + p + q + bigp + bigq + d + sd = 0
+                                              AND ktrend = 1
+                                              AND (SELECT degree FROM query_table(degs_tbl)
+                                                   WHERE idx = 1) = 0)
         WHERE out_of_core
     ) zsp
 ),

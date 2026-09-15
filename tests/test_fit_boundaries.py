@@ -89,9 +89,8 @@ def test_restart_preserves_best_visited_likelihood(con, out_of_core):
     y = 1e-10*(2+np.sin(np.arange(1.,31.)))
     con.execute("CREATE OR REPLACE TABLE boundary_restart(t BIGINT,y DOUBLE)")
     con.executemany("INSERT INTO boundary_restart VALUES (?,?)", list(enumerate(y, 1)))
-    # The default OLS initializer is already the analytic optimum. The
-    # relational initializer uses zero mean and the raw second moment.
-    initial_mean = 0 if out_of_core else y.mean()
+    # Both constant-mean initializers start at the analytic optimum.
+    initial_mean = y.mean()
     initial_variance = np.mean((y-initial_mean)**2)
     initial_ll = -.5*len(y)*(np.log(2*np.pi*initial_variance)+1)
     con.execute("""
@@ -165,3 +164,32 @@ def test_zero_variance_white_noise_rejected(con, out_of_core, concentrate,
                 sd:=?,s:=?,out_of_core:=?,concentrate:=?,t_col:='t',
                 compute_bse:=false)
         """, [d,sd,s,out_of_core,concentrate]).fetchall()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_large_unit_constant_mean_matches_analytic_fit(con, out_of_core,
+                                                      concentrate, missing):
+    y = 1e10*(2+np.sin(np.arange(1.,31.)))
+    if missing:
+        y[[2,11]] = np.nan
+    con.execute("CREATE OR REPLACE TABLE boundary_mean(t BIGINT,y DOUBLE)")
+    con.executemany("INSERT INTO boundary_mean VALUES (?,?)",
+                    [(i,None if np.isnan(v) else float(v)) for i,v in enumerate(y,1)])
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_mean_model AS
+        SELECT * FROM sarimax_fit('boundary_mean','y',0,0,0,trend:='c',
+            t_col:='t',out_of_core:=?,concentrate:=?,compute_bse:=false)
+    """, [out_of_core,concentrate])
+    meta = dict(con.execute("SELECT name,value FROM boundary_mean_model WHERE kind='meta'").fetchall())
+    mean = con.execute("SELECT value FROM boundary_mean_model WHERE kind='param' AND name='intercept'").fetchone()[0]
+    variance = np.nanvar(y)
+    np.testing.assert_allclose(mean,np.nanmean(y),rtol=1e-10)
+    np.testing.assert_allclose(meta['sigma2'],variance,rtol=1e-10)
+    np.testing.assert_allclose(meta['loglik'],
+        -.5*np.isfinite(y).sum()*(np.log(2*np.pi*variance)+1),rtol=1e-12)
+    forecast = con.execute("""
+        SELECT yhat FROM sarimax_forecast('boundary_mean_model','boundary_mean','y',3,t_col:='t')
+    """).fetchnumpy()['yhat']
+    np.testing.assert_allclose(forecast,np.nanmean(y),rtol=1e-10)
