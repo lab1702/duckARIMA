@@ -5578,7 +5578,12 @@ _sarimax_units_xmax AS (
     SELECT j, max(abs(x)) AS magnitude FROM query_table(exog_tbl) GROUP BY j
 ),
 _sarimax_units_gate AS (
-    SELECT r > 0 AND d + sd = 0 AND
+    -- The intercept-only white-noise initializer already has the analytic
+    -- optimum; retain it in original units to preserve its exact variance.
+    SELECT r + ktrend > 0 AND d + sd = 0
+           AND NOT (r + p + q + bigp + bigq = 0 AND ktrend = 1
+                    AND coalesce((SELECT degree = 0 FROM query_table(degs_tbl)
+                                  WHERE idx = 1), false)) AND
            (ym.magnitude > 1e3 OR (ym.magnitude > 0e0 AND ym.magnitude < 1e-3)
             OR coalesce((SELECT bool_or(magnitude > 1e3
                                 OR (magnitude > 0e0 AND magnitude < 1e-3))

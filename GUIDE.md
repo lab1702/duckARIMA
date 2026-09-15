@@ -110,9 +110,10 @@ behavior", recorded here so nothing is implicit in code:
    retained point before claiming convergence there. If the returned point
    cannot be certified, `converged` remains false. The reported gradient belongs
    to the returned parameters, while counters describe the attempted run.
-   Stationary regression fits normalize target and regressor magnitudes when
-   any nonzero maximum absolute value falls outside `[1e-3, 1e3]`. Their
-   `grad_norm` uses these normalized optimizer coordinates; coefficients,
+   Stationary fits with regressors or trend terms normalize target and regressor magnitudes when
+   any nonzero maximum absolute value falls outside `[1e-3, 1e3]`;
+   intercept-only white-noise fits retain their analytic initialization. The
+   normalized fits report `grad_norm` in optimizer coordinates; coefficients,
    variance, likelihood and forecasts retain the original units. Models
    with integration inside the state vector retain their original units
    because their fixed diffuse initial covariance is not scale-equivariant.

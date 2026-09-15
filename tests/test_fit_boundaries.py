@@ -269,3 +269,35 @@ def test_small_unit_concentrated_bse_at_zero_coefficient(con, out_of_core):
     result = dict(rows)
     np.testing.assert_allclose(result['param'],0,atol=1e-18)
     np.testing.assert_allclose(result['bse'],1e-10/np.sqrt(40),rtol=1e-3,atol=0)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("scale", [1e-10, 1e10])
+def test_trend_only_fit_preserves_units(con, out_of_core, concentrate, scale):
+    t = np.arange(1.,41.)
+    y = scale*(2+.1*t+np.sin(t))
+    # State initialization uses c_1 at t=1; subsequent observations use c_(t-1).
+    design = np.column_stack([np.ones(len(t)), np.maximum(t-1,1)])
+    beta = np.linalg.lstsq(design,y,rcond=None)[0]
+    variance = np.mean((y-design@beta)**2)
+    expected_ll = -.5*len(y)*(np.log(2*np.pi*variance)+1)
+    con.execute("CREATE OR REPLACE TABLE boundary_trend_units(t BIGINT,y DOUBLE)")
+    con.executemany("INSERT INTO boundary_trend_units VALUES (?,?)",
+                    [(i,float(v)) for i,v in enumerate(y,1)])
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_trend_units_model AS
+        SELECT * FROM sarimax_fit('boundary_trend_units','y',0,0,0,trend:='ct',
+            t_col:='t',out_of_core:=?,concentrate:=?)
+    """, [out_of_core,concentrate])
+    meta = dict(con.execute("SELECT name,value FROM boundary_trend_units_model WHERE kind='meta'").fetchall())
+    actual_beta = con.execute("SELECT value FROM boundary_trend_units_model WHERE kind='param' AND name<>'sigma2' ORDER BY idx").fetchnumpy()['value']
+    assert meta['converged'] == 1
+    np.testing.assert_allclose(actual_beta,beta,rtol=1e-6,atol=0)
+    np.testing.assert_allclose(meta['sigma2'],variance,rtol=1e-6,atol=0)
+    np.testing.assert_allclose(meta['loglik'],expected_ll,rtol=1e-9,atol=1e-7)
+    yhat = con.execute("""
+        SELECT yhat FROM sarimax_forecast('boundary_trend_units_model',
+            'boundary_trend_units','y',3,t_col:='t')
+    """).fetchnumpy()['yhat']
+    np.testing.assert_allclose(yhat,beta[0]+beta[1]*np.arange(40.,43.),rtol=1e-6,atol=0)
