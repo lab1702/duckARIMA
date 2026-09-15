@@ -124,9 +124,7 @@ def test_fit_rejects_nonfinite_optimum(con, out_of_core, projection, value):
                 "FROM range(1,31) q(t)")
     columns = "value" if projection == "spec" else projection
     suffix = " WHERE kind='spec'" if projection == "spec" else ""
-    # The relational likelihood rejects zero scale before reaching the fit gate.
-    message = "cannot take logarithm of zero" if out_of_core and value == "0e0" else "non-finite loglikelihood"
-    with pytest.raises(duckdb.Error, match=message):
+    with pytest.raises(duckdb.Error, match="non-finite loglikelihood"):
         con.execute(f"SELECT {columns} FROM sarimax_fit('poisoned','y',0,0,0,"
                     "concentrate := true,compute_bse := false,t_col := 't',"
                     f"out_of_core := {out_of_core})" + suffix).fetchall()

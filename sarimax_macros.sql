@@ -2555,12 +2555,19 @@ WITH _sarimax_ll2_args AS (
     SELECT conc::BIGINT AS zconc
 )
 SELECT st.probe_id, st.n_eff,
-       CASE WHEN za.zconc = 1
+       CASE WHEN NOT coalesce(isfinite(st.sumlogf), false)
+                 OR (za.zconc = 1 AND NOT coalesce(
+                     st.cnt > 0 AND isfinite(st.ssq / st.cnt)
+                     AND st.ssq / st.cnt > 0e0, false))
+            THEN NULL::DOUBLE
+            WHEN za.zconc = 1
             THEN -5e-1 * (st.cnt * ln(2e0 * pi()) + st.sumlogf
                           + st.cnt * ln(st.ssq / st.cnt) + st.cnt)
             ELSE -5e-1 * (st.cnt * ln(2e0 * pi()) + st.sumlogf + st.ssq)
        END AS loglik,
-       CASE WHEN za.zconc = 1 THEN st.ssq / st.cnt
+       CASE WHEN za.zconc = 1 AND isfinite(st.sumlogf)
+                      AND st.cnt > 0 AND isfinite(st.ssq / st.cnt)
+                      AND st.ssq / st.cnt > 0e0 THEN st.ssq / st.cnt
             ELSE NULL::DOUBLE END AS scale2
 FROM _sarimax_kfilter_state_v2(obs_tbl, sys_tbl) st, _sarimax_ll2_args za;
 

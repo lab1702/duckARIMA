@@ -125,3 +125,24 @@ def test_information_inversion_handles_different_parameter_units(con, units):
 def test_information_inversion_still_rejects_singular_matrix(con):
     actual = con.execute("SELECT _sarimax_information_bse([1e-20,1e0,1e0,1e20],2)").fetchone()[0]
     assert actual == [None, None]
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+def test_concentrated_ar_boundary_bse_does_not_abort_fit(con, out_of_core):
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_ar AS
+        SELECT t, 1+1e-4*sin(t) AS y FROM range(1,31) a(t)
+    """)
+    fits = []
+    for compute_bse in [False, True]:
+        rows = con.execute("""
+            SELECT kind,name,value FROM sarimax_fit('boundary_ar','y',1,0,0,
+                concentrate := true, out_of_core := ?, t_col := 't',
+                compute_bse := ?)
+        """, [out_of_core, compute_bse]).fetchall()
+        fits.append({(kind,name): value for kind,name,value in rows
+                     if kind in ('param','meta')})
+    assert fits[1][('meta','converged')] == 1
+    assert np.isfinite(fits[1][('meta','loglik')])
+    for key in [('meta','loglik'), ('param','ar.L1')]:
+        np.testing.assert_allclose(fits[1][key], fits[0][key], rtol=1e-12)
