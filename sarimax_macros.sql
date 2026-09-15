@@ -4918,6 +4918,7 @@ _sarimax_bf2_it USING KEY (zkk) AS (
     -- ---------------- anchor: f and gradient at x0 ----------------
     SELECT 1::INT AS zkk, 0::INT AS ziter,
            za2.zx AS zx, za2.zfx AS zfx, za2.zg_new AS zgx,
+           za2.zx AS zinc_x, za2.zfx AS zinc_fx, za2.zg_new AS zinc_g,
            list_transform(range(1, za2.znp * za2.znp + 1), lambda zidx:
                CASE WHEN (zidx - 1) // za2.znp = (zidx - 1) % za2.znp THEN 1e0 ELSE 0e0 END) AS zhinv,
            CASE WHEN NOT coalesce(isfinite(za2.zfx), false)
@@ -5044,6 +5045,21 @@ _sarimax_bf2_it USING KEY (zkk) AS (
     UNION ALL
 
     -- ---------------- one BFGS iteration ----------------
+    -- A successful restart at an inferior point must recheck the incumbent
+    -- itself before certifying it. Retain the iteration bound for this check.
+    SELECT znext.zkk, znext.ziter,
+           CASE WHEN zrecheck THEN znext.zinc_x ELSE znext.zx END AS zx,
+           CASE WHEN zrecheck THEN znext.zinc_fx ELSE znext.zfx END AS zfx,
+           CASE WHEN zrecheck THEN znext.zinc_g ELSE znext.zgx END AS zgx,
+           znext.zinc_x, znext.zinc_fx, znext.zinc_g,
+           CASE WHEN zrecheck THEN
+               list_transform(range(1, len(znext.zx)*len(znext.zx)+1), lambda zi:
+                   CASE WHEN (zi-1)//len(znext.zx) = (zi-1)%len(znext.zx)
+                        THEN 1e0 ELSE 0e0 END)
+                ELSE znext.zhinv END AS zhinv,
+           CASE WHEN zrecheck THEN 0 ELSE znext.zstatus END AS zstatus,
+           znext.zrestarted, znext.zlsf
+    FROM (
     SELECT zfin.zkk,
            CASE WHEN zfin.zrestart_ls OR zfin.zrestart2 THEN 0 ELSE zfin.zniter END AS ziter,
            CASE WHEN zfin.zterminal_ls OR zfin.zstall_ls OR zfin.zgterm THEN zfin.zx
@@ -5058,6 +5074,15 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                 WHEN zfin.zrestart_ls THEN zfin.zg_new
                 WHEN zfin.zrestart2 THEN zfin.zg2
                 ELSE zfin.zg_new END AS zgx,
+           CASE WHEN isfinite(zfin.zfx) AND
+                          (NOT coalesce(isfinite(zfin.zinc_fx), false) OR zfin.zfx < zfin.zinc_fx)
+                THEN zfin.zx ELSE zfin.zinc_x END AS zinc_x,
+           CASE WHEN isfinite(zfin.zfx) AND
+                          (NOT coalesce(isfinite(zfin.zinc_fx), false) OR zfin.zfx < zfin.zinc_fx)
+                THEN zfin.zfx ELSE zfin.zinc_fx END AS zinc_fx,
+           CASE WHEN isfinite(zfin.zfx) AND
+                          (NOT coalesce(isfinite(zfin.zinc_fx), false) OR zfin.zfx < zfin.zinc_fx)
+                THEN zfin.zgx ELSE zfin.zinc_g END AS zinc_g,
            CASE WHEN zfin.zrestart_ls OR zfin.zrestart2
                 THEN list_transform(range(1, zfin.znp * zfin.znp + 1), lambda zidx:
                          CASE WHEN (zidx - 1) // zfin.znp = (zidx - 1) % zfin.znp
@@ -5255,6 +5280,7 @@ _sarimax_bf2_it USING KEY (zkk) AS (
                                                                             FROM (
                                                                                 SELECT zit.zkk, zit.ziter, zit.zx, zit.zfx,
                                                                                        zit.zgx, zit.zhinv, zit.zrestarted,
+                                                                                       zit.zinc_x, zit.zinc_fx, zit.zinc_g,
                                                                                        zit.zlsf, zpc.znp, zpc.zwl, zpc.zxm,
                                                                                        zpc.zdg,
                                                                                        list_transform(range(1, zpc.znp + 1),
@@ -5480,6 +5506,30 @@ _sarimax_bf2_it USING KEY (zkk) AS (
             ) zs8
         ) zs9
     ) zfin
+    ) znext
+    CROSS JOIN LATERAL (
+        SELECT znext.zstatus = 1 AND znext.zrestarted AND znext.ziter < 500
+               AND coalesce(isfinite(znext.zinc_fx), false)
+               AND znext.zfx - znext.zinc_fx >
+                   7.105427357601002e-15 * greatest(1e0, abs(znext.zfx)) AS zrecheck
+    ) zrc
+),
+-- A failed or inferior restart must not discard an earlier better point.
+-- Keep termination counters, but do not certify convergence at a restored
+-- incumbent merely because the final (inferior) point was certified.
+_sarimax_bf2_final AS (
+    SELECT zlast.* EXCLUDE (zx, zfx, zgx, zstatus, zrestore),
+           CASE WHEN zrestore THEN zinc_x ELSE zx END AS zx,
+           CASE WHEN zrestore THEN zinc_fx ELSE zfx END AS zfx,
+           CASE WHEN zrestore THEN zinc_g ELSE zgx END AS zgx,
+           CASE WHEN zrestore AND (zstatus <> 1 OR zfx-zinc_fx >
+                          7.105427357601002e-15 * greatest(1e0, abs(zfx)))
+                THEN 3 ELSE zstatus END AS zstatus
+    FROM (
+        SELECT *, coalesce(isfinite(zinc_fx), false)
+                  AND (NOT coalesce(isfinite(zfx), false) OR zinc_fx < zfx) AS zrestore
+        FROM _sarimax_bf2_it
+    ) zlast
 )
 SELECT zit.zx AS x_opt,
        _sarimax_transform_params_v2(zit.zx, ktrend + r, p, q, bigp, bigq, conc) AS params,
@@ -5494,7 +5544,7 @@ SELECT zit.zx AS x_opt,
                    lambda za, zb: greatest(za, zb)) AS grad_norm,
        zit.zrestarted AS restarted,
        zit.zlsf AS ls_failures
-FROM _sarimax_bf2_it zit, _sarimax_bf2_pc zpc;
+FROM _sarimax_bf2_final zit, _sarimax_bf2_pc zpc;
 
 -- ---- 3e. standard errors (v2 objective; v1 section 2d semantics) ---------------
 
@@ -5506,8 +5556,10 @@ FROM _sarimax_bf2_it zit, _sarimax_bf2_pc zpc;
 --
 -- DOCUMENTED DEVIATION (kdiff-aware step size): h_i = 1e-4 *
 -- greatest(0.1, |theta_i|) exactly as v1 when kdiff = 0, but 1e-3 *
--- greatest(0.1, |theta_i|) when kdiff > 0. The approximate-diffuse 1e6
--- initialization leaves parameter-dependent quantization noise of ~1e-9 ..
+-- greatest(0.1, |theta_i|) when kdiff > 0.
+-- The strictly positive variance coordinate instead uses |sigma2| without
+-- the 0.1 floor, keeping both probes inside its domain at small target scales.
+-- Approximate-diffuse initialization leaves quantization noise of ~1e-9 ..
 -- 1e-7 in the loglikelihood (see section 3 header); a second difference
 -- divides it by h^2, so the v1 step turns that noise into 1e-2-relative
 -- Hessian errors on the diffuse fixtures. A measured sweep (1e-4 .. 1e-2,
@@ -5539,7 +5591,9 @@ _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
         FROM (
             SELECT zi,
                    (list_transform([(CASE WHEN d + s * sd > 0 THEN 1e-3 ELSE 1e-4 END)
-                                    * greatest(1e-1, abs(zcc[zi]))], lambda zh0:
+                                    * CASE WHEN NOT conc AND zi = len(zcc)
+                                           THEN abs(zcc[zi])
+                                           ELSE greatest(1e-1, abs(zcc[zi])) END], lambda zh0:
                         CASE WHEN (_sarimax_ll_c_v2(list_transform(zcc, lambda zv2, zi2:
                                       CASE WHEN zi2 = zi THEN zv2 + zh0 ELSE zv2 END),
                                       zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
@@ -5681,7 +5735,9 @@ _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
                          ELSE zh0 * 25e-2 END AS zh
             FROM (SELECT zin.zc AS zcc, zu.zi,
                          (CASE WHEN d + s * sd > 0 THEN 1e-3 ELSE 1e-4 END)
-                         * greatest(1e-1, abs(zin.zc[zu.zi])) AS zh0
+                         * CASE WHEN NOT conc AND zu.zi = zin.znp
+                                THEN abs(zin.zc[zu.zi])
+                                ELSE greatest(1e-1, abs(zin.zc[zu.zi])) END AS zh0
                   FROM unnest(range(1, zin.znp + 1)) AS zu(zi))
         )
     ) zhh

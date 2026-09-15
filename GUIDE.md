@@ -103,7 +103,11 @@ behavior", recorded here so nothing is implicit in code:
    with integration inside the state vector, a second exhausted line search
    after the restart can set this flag even when `grad_norm` remains large;
    inspect `grad_norm` alongside the flag. `restarted = 1` flags the one
-   perturbed restart.
+   perturbed restart. The best visited parameters and likelihood are retained
+   across restarts. A successful but inferior restart is rechecked from the
+   retained point before claiming convergence there. If the returned point
+   cannot be certified, `converged` remains false. The reported gradient belongs
+   to the returned parameters, while counters describe the attempted run.
 10. **Seasonal argument names**: `sp/sd/sq` stand in for P/D/Q because DuckDB
     macro parameters are case-insensitive.
 11. **Re-supplying `exog_cols`**: the forecast/diagnostics macros take the
