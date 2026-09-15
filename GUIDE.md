@@ -233,7 +233,10 @@ All failures raise immediately with a message naming the offender:
   anchors are NULL (missing trailing observations);
 - rank check: after differencing, the exog Gram matrix must pass a pivot
   threshold (1e-10 × trace) — a constant column under differencing is the
-  canonical rejection, reported by column;
+  canonical rejection, reported by column. With integration inside the state
+  vector, the observed design must also add rank beyond the homogeneous
+  integration-state patterns; variation only on missing-target rows cannot
+  identify a coefficient;
 - too few usable observations after burn-in for the mean and ARMA parameters,
 - all-zero model-scale observations for a zero-mean white-noise model (including
   zeros produced by simple differencing), or constant observations with a fitted

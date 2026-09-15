@@ -54,3 +54,33 @@ def test_raw_integrated_missing_data_still_identifies_exog(con, out_of_core):
                        "t_col := 't',compute_bse := false,simple_differencing := false, "
                        f"out_of_core := {out_of_core})").fetchall()
     assert any(row[0] == 'param' and row[1] == 'x' for row in rows)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("d,sd,s,basis", [(1,0,1,"1e0"), (2,0,1,"t::DOUBLE"),
+                                        (0,1,4,"(t%4)::DOUBLE"), (1,1,4,"t::DOUBLE"),
+                                        (0,2,4,"t*(t%4)::DOUBLE")])
+def test_missing_targets_cannot_identify_diffuse_regressor(con, out_of_core,
+                                                         concentrate,d,sd,s,basis):
+    con.execute(f"""
+        CREATE OR REPLACE TABLE obs AS
+        SELECT t,CASE WHEN t%5=0 THEN NULL ELSE sin(t) END AS y,
+               CASE WHEN t%5=0 THEN cos(t) ELSE {basis} END AS x
+        FROM range(1,61) q(t)
+    """)
+    with pytest.raises(duckdb.Error,match="rank-deficient.*integration states"):
+        con.execute("""
+            SELECT * FROM sarimax_fit('obs','y',0,?,0,sd:=?,s:=?,exog_cols:=['x'],
+                t_col:='t',simple_differencing:=false,concentrate:=?,out_of_core:=?)
+        """, [d,sd,s,concentrate,out_of_core]).fetchall()
+
+
+def test_unobserved_seasonal_phases_do_not_reject_identified_design(con):
+    # Only one seasonal phase is observed; redundant nuisance columns must
+    # be skipped without rejecting an independent observed regressor.
+    con.execute("""
+        CREATE OR REPLACE TABLE observed_design AS
+        SELECT t,1 AS j,cos(t) AS x FROM range(1,61) a(t) WHERE t%4=1
+    """)
+    assert con.execute("SELECT ok FROM _sarimax_observed_diffuse_rank('observed_design',0,1,4,true)").fetchone()[0]

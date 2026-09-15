@@ -509,6 +509,71 @@ SELECT st.t, st.j,
        list_sum(list_transform(st.a, lambda av, ai: av * na.zv[ai])) AS x
 FROM _sarimax_nt_states st, _sarimax_nt_args na;
 
+-- Test identification modulo the homogeneous integration-state span on
+-- observed rows. A basis for (1-L)^d (1-L^s)^sd consists of seasonal
+-- indicator-polynomials of degrees 0..sd-1 and global polynomials of degrees
+-- sd..sd+d-1. Missing seasonal phases may make this nuisance basis singular;
+-- skip those pivots, but require every supplied mean column to add rank.
+-- Only the model-sized Gram matrix is collected into a LIST.
+CREATE OR REPLACE MACRO _sarimax_observed_diffuse_rank(design_tbl, d, sd, s, enabled) AS TABLE
+WITH RECURSIVE
+_sarimax_dr_in AS MATERIALIZED (
+    SELECT t,j,x FROM query_table(design_tbl) WHERE enabled
+),
+_sarimax_dr_dims AS (
+    SELECT CASE WHEN enabled THEN d+s*sd ELSE 0 END AS kd,
+           coalesce(max(j),0) AS r, coalesce(max(t),1)::DOUBLE AS n
+    FROM _sarimax_dr_in
+),
+_sarimax_dr_design AS (
+    SELECT ti.t, dg.j,
+           CASE WHEN dg.j <= s*sd
+                THEN CASE WHEN ti.t%s = (dg.j-1)%s
+                          THEN pow(ti.t/dm.n,(dg.j-1)//s) ELSE 0e0 END
+                ELSE pow(ti.t/dm.n,sd+dg.j-s*sd-1) END AS x
+    FROM (SELECT DISTINCT t FROM _sarimax_dr_in) ti,
+         _sarimax_dr_dims dm, unnest(range(1,dm.kd+1)) dg(j)
+    UNION ALL
+    SELECT t,j+dm.kd,x FROM _sarimax_dr_in, _sarimax_dr_dims dm
+),
+_sarimax_dr_max AS (
+    SELECT j,max(abs(x)) AS magnitude FROM _sarimax_dr_design GROUP BY j
+),
+_sarimax_dr_scaled AS MATERIALIZED (
+    SELECT t,j,CASE WHEN magnitude>0e0 THEN x/magnitude ELSE 0e0 END AS x
+    FROM _sarimax_dr_design JOIN _sarimax_dr_max USING(j)
+),
+_sarimax_dr_gram AS MATERIALIZED (
+    SELECT a.j AS i,b.j AS j,sum(a.x*b.x) AS v
+    FROM _sarimax_dr_scaled a JOIN _sarimax_dr_scaled b USING(t)
+    GROUP BY a.j,b.j
+),
+_sarimax_dr_matrix AS (
+    SELECT list(CASE WHEN a.v>0e0 AND b.v>0e0
+                     THEN g.v/sqrt(a.v)/sqrt(b.v) ELSE 0e0 END ORDER BY g.i,g.j) AS mat
+    FROM _sarimax_dr_gram g
+    JOIN _sarimax_dr_gram a ON a.i=g.i AND a.j=g.i
+    JOIN _sarimax_dr_gram b ON b.i=g.j AND b.j=g.j
+),
+_sarimax_dr_pivots AS (
+    SELECT 0 AS step,mat AS a,true AS ok,dm.kd,dm.kd+dm.r AS m
+    FROM _sarimax_dr_matrix, _sarimax_dr_dims dm
+    UNION ALL
+    SELECT step+1,
+           CASE WHEN a[step*m+step+1] > 1e-10*m
+                THEN list_transform(a,lambda value,idx:
+                    CASE WHEN (idx-1)//m>step AND (idx-1)%m>step
+                         THEN value-a[((idx-1)//m)*m+step+1]
+                                   *a[step*m+(idx-1)%m+1]/a[step*m+step+1]
+                         ELSE value END)
+                ELSE a END,
+           ok AND (step<kd OR coalesce(a[step*m+step+1]>1e-10*m,false)),kd,m
+    FROM _sarimax_dr_pivots WHERE step<m AND ok
+)
+SELECT CASE WHEN bool_and(ok) THEN true
+            ELSE error('sarimax: observed mean design is rank-deficient after removing integration states') END AS ok
+FROM _sarimax_dr_pivots;
+
 CREATE OR REPLACE MACRO sarimax_fit(data, y_col, p, d, q,
                                     sp := 0, sd := 0, sq := 0, s := 1,
                                     exog_cols := []::VARCHAR[], t_col := NULL,
@@ -630,7 +695,10 @@ _sarimax_f_model_chk AS MATERIALIZED (
              WHEN NOT ((SELECT coalesce(bool_and(ok), true)
                          FROM _sarimax_rank_check('_sarimax_f_rank_design'))
                        AND (SELECT coalesce(bool_and(ok), true)
-                            FROM _sarimax_rank_check('_sarimax_f_observed_design')))
+                            FROM _sarimax_rank_check('_sarimax_f_observed_design'))
+                       AND (SELECT ok FROM _sarimax_observed_diffuse_rank(
+                            '_sarimax_f_observed_design',d,sd,greatest(s,1),
+                            NOT simple_differencing AND d+sd>0 AND len(exog_cols)>0)))
                THEN false
              WHEN (SELECT count(y) FROM _sarimax_f_y_unchecked
                    WHERE t > CASE WHEN simple_differencing THEN 0
