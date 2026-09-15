@@ -3000,6 +3000,28 @@ FROM _sarimax_bf2_final zit, _sarimax_bf2_pc zpc;
 -- acceptance gate for that fixture is 2e-2, everything else 1e-3).
 -- statsmodels sidesteps the noise with complex-step differentiation, which
 -- has no SQL equivalent.
+-- Congruence-scale the information matrix to dimensionless coordinates.
+-- The generic solver's absolute pivot threshold must not depend on parameter
+-- units. If D_i = sqrt(abs(H_ii)), invert D^-1 H D^-1, then map SE_i back
+-- by dividing by D_i. A zero diagonal keeps unit scale for the solver to
+-- diagnose; invalid or nonpositive inverse diagonals still produce NULL SEs.
+CREATE OR REPLACE MACRO _sarimax_information_bse(info, n) AS (
+    CASE WHEN n = 0 THEN []::DOUBLE[] ELSE
+    (list_transform([list_transform(range(1, n+1), lambda zi:
+        (list_transform([info[(zi-1)*n+zi]], lambda zd:
+            CASE WHEN isfinite(zd) AND abs(zd)>0e0 THEN sqrt(abs(zd))
+                 ELSE 1e0 END))[1])], lambda zscale:
+        (list_transform([_sarimax_inv_list(
+            list_transform(range(1, n*n+1), lambda zi:
+                info[zi] / zscale[(zi-1)//n+1] / zscale[(zi-1)%n+1]), n)],
+            lambda zinv:
+                list_transform(range(1, n+1), lambda zi:
+                    (list_transform([(zinv.x)[(zi-1)*n+zi]], lambda zd:
+                        CASE WHEN zinv.ok AND isfinite(zd) AND zd>0e0
+                             THEN sqrt(zd)/zscale[zi] ELSE NULL END))[1])))[1]))[1]
+    END
+);
+
 CREATE OR REPLACE MACRO _sarimax_bse_v2(params, ylist, xmat, degs,
                                         r, p, q, bigp, bigq, s, d, sd,
                                         ktrend, conc) AS TABLE
@@ -3096,10 +3118,7 @@ _sarimax_bs2_tri AS (     -- upper-triangle H cells, ordered (i, j), i <= j
         )
     ) zgr
 )
-SELECT (list_transform([_sarimax_inv_list(zng.znegh, zng.znp)], lambda zinv:
-           list_transform(range(1, zng.znp + 1), lambda zi6:
-               (list_transform([(zinv.x)[(zi6 - 1) * zng.znp + zi6]], lambda zdv:
-                    CASE WHEN (zinv.ok) AND zdv > 0e0 THEN sqrt(zdv) ELSE NULL END))[1])))[1] AS bse
+SELECT _sarimax_information_bse(zng.znegh, zng.znp) AS bse
 FROM (
     SELECT znp,
            list_transform(range(1, znp * znp + 1), lambda zidx:
@@ -3220,10 +3239,7 @@ _sarimax_bs2_tri AS (     -- upper-triangle H cells, ordered (i, j), i <= j
         )
     ) zgr
 )
-SELECT (list_transform([_sarimax_inv_list(zng.znegh, zng.znp)], lambda zinv:
-           list_transform(range(1, zng.znp + 1), lambda zi6:
-               (list_transform([(zinv.x)[(zi6 - 1) * zng.znp + zi6]], lambda zdv:
-                    CASE WHEN (zinv.ok) AND zdv > 0e0 THEN sqrt(zdv) ELSE NULL END))[1])))[1] AS bse
+SELECT _sarimax_information_bse(zng.znegh, zng.znp) AS bse
 FROM (
     SELECT znp,
            list_transform(range(1, znp * znp + 1), lambda zidx:

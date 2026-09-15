@@ -65,8 +65,8 @@ def test_white_noise_retains_analytic_optimum(con, out_of_core, scale, missing):
 
 
 @pytest.mark.parametrize("out_of_core", [False, True])
-@pytest.mark.parametrize("scale", [1e-3, 1e-6, 1e-10])
-def test_small_variance_has_finite_standard_error(con, out_of_core, scale):
+@pytest.mark.parametrize("scale", [1e-3, 1e-6, 1e-10, 1e4, 1e8])
+def test_variance_standard_error_across_units(con, out_of_core, scale):
     con.execute("""
         CREATE OR REPLACE TABLE boundary_se AS
         SELECT t, ?*sin(t) AS y FROM range(1,31) r(t)
@@ -109,3 +109,19 @@ def test_restart_preserves_best_visited_likelihood(con, out_of_core):
         np.testing.assert_allclose(params['intercept'], initial_mean, rtol=1e-12, atol=0)
         np.testing.assert_allclose(params['sigma2'], initial_variance, rtol=1e-12, atol=0)
         assert meta['converged'] == 0  # restoring a point is not a convergence certificate
+
+
+@pytest.mark.parametrize("units", [[1., 1.], [1e-10, 1e10], [1e10, 1e-10]])
+def test_information_inversion_handles_different_parameter_units(con, units):
+    information = np.array([[3., .4], [.4, 2.]])
+    units = np.array(units)
+    scaled = information*units[:, None]*units[None, :]
+    actual = con.execute("SELECT _sarimax_information_bse(?,2)",
+                         [scaled.ravel().tolist()]).fetchone()[0]
+    expected = np.sqrt(np.diag(np.linalg.inv(information)))/units
+    np.testing.assert_allclose(actual, expected, rtol=1e-12, atol=0)
+
+
+def test_information_inversion_still_rejects_singular_matrix(con):
+    actual = con.execute("SELECT _sarimax_information_bse([1e-20,1e0,1e0,1e20],2)").fetchone()[0]
+    assert actual == [None, None]
