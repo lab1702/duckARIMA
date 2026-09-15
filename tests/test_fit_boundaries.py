@@ -301,3 +301,25 @@ def test_trend_only_fit_preserves_units(con, out_of_core, concentrate, scale):
             'boundary_trend_units','y',3,t_col:='t')
     """).fetchnumpy()['yhat']
     np.testing.assert_allclose(yhat,beta[0]+beta[1]*np.arange(40.,43.),rtol=1e-6,atol=0)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("offset", [1e2,1e6,1e10])
+def test_constant_mean_bse_uses_noise_not_offset(con, out_of_core, concentrate, offset):
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_offset AS
+        SELECT t,?+sin(t) AS y FROM range(1,31) a(t)
+    """, [offset])
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_offset_model AS
+        SELECT * FROM sarimax_fit('boundary_offset','y',0,0,0,trend:='c',
+            t_col:='t',out_of_core:=?,concentrate:=?)
+    """, [out_of_core,concentrate])
+    sigma2 = con.execute("SELECT value FROM boundary_offset_model WHERE kind='meta' AND name='sigma2'").fetchone()[0]
+    actual_se = con.execute("SELECT value FROM boundary_offset_model WHERE kind='bse' AND name='intercept'").fetchone()[0]
+    np.testing.assert_allclose(actual_se,np.sqrt(sigma2/30),rtol=1e-3,atol=0)
+
+
+def test_unrepresentable_local_hessian_step_is_unavailable(con):
+    assert con.execute("SELECT _sarimax_bse_coordinate_step(1e16,1e-2,1e-4,true)").fetchone()[0] is None

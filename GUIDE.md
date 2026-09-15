@@ -90,7 +90,9 @@ behavior", recorded here so nothing is implicit in code:
    loglikelihood in the natural (constrained) parameter space at θ̂, inverted
    and negated — comparable to statsmodels' `cov_params_approx`. Stationary
    mean-coordinate perturbations use the fitted noise scale and design
-   magnitudes at extreme units, including when a coefficient is zero.
+   magnitudes at extreme units, including when a coefficient is zero or a
+   large offset dwarfs residual variation. If floating-point resolution
+   prevents a sufficiently local probe, the standard error is unavailable.
 8. **AIC/BIC**: AIC = 2k − 2ℓ, BIC = k·ln(n_eff − burn) − 2ℓ. k **always
    counts σ², even when the scale is concentrated** (statsmodels' `df_model`
    does the same — pinned empirically against the fixtures_v2 references),
