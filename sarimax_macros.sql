@@ -4054,7 +4054,7 @@ _sarimax_spo_sig AS (
                                  ' (model scale) leaves no observations after differencing'))
              WHEN zny = 0
                THEN error('duckARIMA v2 start values: model-scale series has no usable observations after burn-in')
-             WHEN p + q + bigp + bigq > 0
+             WHEN p + q + bigp + bigq + r + ktrend > 0
                   AND zn - _sarimax_kdiff(d, sd, s) <
                       greatest(
                           p + s * bigp + 1,
@@ -4065,7 +4065,7 @@ _sarimax_spo_sig AS (
                                       (zn - _sarimax_kdiff(d, sd, s) - 1) // 2)
                                     + 1 + q + s * bigq
                                ELSE 1 END)
-                      + p + q + bigp + bigq
+                      + p + q + bigp + bigq + r + ktrend
                THEN error(concat(
                       'duckARIMA v2 start values: n_eff = ',
                       zn - _sarimax_kdiff(d, sd, s),
@@ -4248,10 +4248,10 @@ _sarimax_sq_dims AS (
 ),
 _sarimax_sq_dims3 AS (
     SELECT zne, zm, zncoef2,
-           CASE WHEN zncoef2 > 0 AND zne < zt0raw + zncoef2
+           CASE WHEN zncoef2 + r + ktrend > 0 AND zne < zt0raw + zncoef2 + r + ktrend
                 THEN error(concat('duckARIMA v2 start values: n_eff = ', zne,
                                   ' (model scale) is too small for the Hannan-Rissanen',
-                                  ' stage-2 regression; need n_eff >= ', zt0raw + zncoef2,
+                                  ' stage-2 regression; need n_eff >= ', zt0raw + zncoef2 + r + ktrend,
                                   ' (long-AR order m = ', zm, ')'))
                 ELSE zt0raw END AS zt0
     FROM (
@@ -4929,9 +4929,17 @@ _sarimax_bf2_it USING KEY (zkk) AS (
            false AS zrestarted, 0::INT AS zlsf
     FROM (
         SELECT za1.*,
-               list_transform(range(1, za1.znp + 1), lambda zi:
+               -- With no mean, ARMA or integration parameters, both
+               -- initializers return mean(y*y), the exact variance MLE.
+               -- Its derivative is zero regardless of the target's units;
+               -- an absolute finite-difference step can spuriously restart it.
+               CASE WHEN r + ktrend + p + q + bigp + bigq + d + sd = 0
+                          AND NOT conc
+                          AND (SELECT sum(y*y) > 0e0 FROM query_table(y_tbl))
+                    THEN [0e0]::DOUBLE[]
+                    ELSE list_transform(range(1, za1.znp + 1), lambda zi:
                    (za1.zfpm[2 * zi - 1] - za1.zfpm[2 * zi])
-                   / (2e0 * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(za1.zx[zi])))) AS zg_new
+                   / (2e0 * (CASE WHEN d + s * sd > 0 THEN 1e-5 ELSE 1e-7 END) * greatest(1e0, abs(za1.zx[zi])))) END AS zg_new
         FROM (
             SELECT zpc.zx0 AS zx, zpc.znp,
                    CASE WHEN NOT out_of_core
@@ -7013,12 +7021,20 @@ _sarimax_f_model_chk AS MATERIALIZED (
                    WHERE t > CASE WHEN simple_differencing THEN 0
                                   ELSE _sarimax_kdiff(d, sd, s) END) = 0
                THEN error('sarimax: model-scale series has no usable observations after burn-in')
+             WHEN NOT ((SELECT coalesce(bool_and(ok), true)
+                         FROM _sarimax_rank_check('_sarimax_f_rank_design'))
+                       AND (SELECT coalesce(bool_and(ok), true)
+                            FROM _sarimax_rank_check('_sarimax_f_observed_design')))
+               THEN false
+             WHEN (SELECT count(y) FROM _sarimax_f_y_unchecked
+                   WHERE t > CASE WHEN simple_differencing THEN 0
+                                  ELSE _sarimax_kdiff(d, sd, s) END)
+                    <= len(exog_cols) + len(_sarimax_trend_degrees(trend)) + p + q + sp + sq
+               THEN error(concat('sarimax: too few usable observations after burn-in; need at least ',
+                         len(exog_cols) + len(_sarimax_trend_degrees(trend)) + p + q + sp + sq + 1,
+                         ' for the requested mean and ARMA parameters'))
              ELSE true
-           END
-           AND (SELECT coalesce(bool_and(ok), true)
-                FROM _sarimax_rank_check('_sarimax_f_rank_design'))
-           AND (SELECT coalesce(bool_and(ok), true)
-                FROM _sarimax_rank_check('_sarimax_f_observed_design')) AS ok
+           END AS ok
 ),
 _sarimax_f_y AS MATERIALIZED (
     SELECT t, y FROM _sarimax_f_y_unchecked, _sarimax_f_model_chk

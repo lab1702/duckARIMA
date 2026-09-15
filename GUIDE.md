@@ -221,8 +221,10 @@ All failures raise immediately with a message naming the offender:
 - rank check: after differencing, the exog Gram matrix must pass a pivot
   threshold (1e-10 × trace) — a constant column under differencing is the
   canonical rejection, reported by column;
-- series too short for the Hannan–Rissanen start-value regressions (the
-  minimum length is stated in the error);
+- too few usable observations after burn-in for the mean and ARMA parameters,
+  or a series too short for the Hannan–Rissanen start-value regressions
+  (including regression and trend dimensions; the required minimum is stated
+  in the error);
 - non-finite loglikelihood at the optimum (poisoned fit) — reported rather
   than silently returned.
 

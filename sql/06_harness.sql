@@ -627,12 +627,20 @@ _sarimax_f_model_chk AS MATERIALIZED (
                    WHERE t > CASE WHEN simple_differencing THEN 0
                                   ELSE _sarimax_kdiff(d, sd, s) END) = 0
                THEN error('sarimax: model-scale series has no usable observations after burn-in')
+             WHEN NOT ((SELECT coalesce(bool_and(ok), true)
+                         FROM _sarimax_rank_check('_sarimax_f_rank_design'))
+                       AND (SELECT coalesce(bool_and(ok), true)
+                            FROM _sarimax_rank_check('_sarimax_f_observed_design')))
+               THEN false
+             WHEN (SELECT count(y) FROM _sarimax_f_y_unchecked
+                   WHERE t > CASE WHEN simple_differencing THEN 0
+                                  ELSE _sarimax_kdiff(d, sd, s) END)
+                    <= len(exog_cols) + len(_sarimax_trend_degrees(trend)) + p + q + sp + sq
+               THEN error(concat('sarimax: too few usable observations after burn-in; need at least ',
+                         len(exog_cols) + len(_sarimax_trend_degrees(trend)) + p + q + sp + sq + 1,
+                         ' for the requested mean and ARMA parameters'))
              ELSE true
-           END
-           AND (SELECT coalesce(bool_and(ok), true)
-                FROM _sarimax_rank_check('_sarimax_f_rank_design'))
-           AND (SELECT coalesce(bool_and(ok), true)
-                FROM _sarimax_rank_check('_sarimax_f_observed_design')) AS ok
+           END AS ok
 ),
 _sarimax_f_y AS MATERIALIZED (
     SELECT t, y FROM _sarimax_f_y_unchecked, _sarimax_f_model_chk

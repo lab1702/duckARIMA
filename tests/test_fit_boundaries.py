@@ -1,0 +1,64 @@
+"""Sample-size validation and exact white-noise fits across target units."""
+from pathlib import Path
+
+import duckdb
+import numpy as np
+import pytest
+
+
+@pytest.fixture(scope="module")
+def con():
+    c = duckdb.connect()
+    c.execute("SET threads=1")
+    c.execute((Path(__file__).resolve().parents[1] / "sarimax_macros.sql").read_text())
+    yield c
+    c.close()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_saturated_regression_rejected(con, out_of_core, concentrate, missing):
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_data AS
+        SELECT t, CASE WHEN t>2 THEN NULL ELSE sin(t) END AS y,
+               CASE WHEN t=1 THEN 1e0 ELSE 0e0 END AS x1,
+               CASE WHEN t=2 THEN 1e0 ELSE 0e0 END AS x2
+        FROM range(1,?) r(t)
+    """, [6 if missing else 3])
+    with pytest.raises(duckdb.Error, match="too few usable observations.*at least 3"):
+        con.execute("""
+            SELECT * FROM sarimax_fit('boundary_data','y',0,0,0,
+                exog_cols := ['x1','x2'], t_col := 't', compute_bse := false,
+                out_of_core := ?, concentrate := ?)
+        """, [out_of_core, concentrate]).fetchall()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("scale", [1., 1e-6, 1e-10])
+@pytest.mark.parametrize("missing", [False, True])
+def test_white_noise_retains_analytic_optimum(con, out_of_core, scale, missing):
+    y = scale * np.sin(np.arange(1., 31.))
+    if missing:
+        y[[2, 11]] = np.nan
+    con.execute("CREATE OR REPLACE TABLE boundary_wn(t BIGINT, y DOUBLE)")
+    con.executemany("INSERT INTO boundary_wn VALUES (?,?)",
+                    [(i, None if np.isnan(v) else float(v)) for i, v in enumerate(y, 1)])
+    expected = np.nanmean(y*y)
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_model AS
+        SELECT * FROM sarimax_fit('boundary_wn','y',0,0,0,
+            t_col := 't', compute_bse := false, out_of_core := ?)
+    """, [out_of_core])
+    meta = dict(con.execute("SELECT name,value FROM boundary_model WHERE kind='meta'").fetchall())
+    np.testing.assert_allclose(meta['sigma2'], expected, rtol=1e-12, atol=0)
+    assert meta['converged'] == 1
+    assert meta['restarted'] == 0
+    assert meta['grad_norm'] == 0
+    n = np.count_nonzero(np.isfinite(y))
+    np.testing.assert_allclose(meta['loglik'], -.5*n*(np.log(2*np.pi*expected)+1), rtol=1e-12)
+    fc = con.execute("""
+        SELECT yhat,se FROM sarimax_forecast('boundary_model','boundary_wn','y',3,t_col:='t')
+    """).fetchnumpy()
+    np.testing.assert_array_equal(fc['yhat'], np.zeros(3))
+    np.testing.assert_allclose(fc['se'], np.sqrt(expected), rtol=1e-12, atol=0)
