@@ -235,10 +235,12 @@ def test_regression_fit_preserves_units(con, out_of_core, concentrate,
     con.execute("""
         CREATE OR REPLACE TABLE boundary_units_model AS
         SELECT * FROM sarimax_fit('boundary_units','y',0,0,0,exog_cols:=['x'],
-            t_col:='t',out_of_core:=?,concentrate:=?,compute_bse:=false)
+            t_col:='t',out_of_core:=?,concentrate:=?)
     """, [out_of_core,concentrate])
     meta = dict(con.execute("SELECT name,value FROM boundary_units_model WHERE kind='meta'").fetchall())
     actual_beta = con.execute("SELECT value FROM boundary_units_model WHERE kind='param' AND name='x'").fetchone()[0]
+    actual_se = con.execute("SELECT value FROM boundary_units_model WHERE kind='bse' AND name='x'").fetchone()[0]
+    np.testing.assert_allclose(actual_se,np.sqrt(variance/np.dot(x,x)),rtol=1e-3,atol=0)
     assert meta['converged'] == 1
     np.testing.assert_allclose(actual_beta,beta,rtol=1e-6,atol=0)
     np.testing.assert_allclose(meta['sigma2'],variance,rtol=1e-6,atol=0)
@@ -250,3 +252,20 @@ def test_regression_fit_preserves_units(con, out_of_core, concentrate,
     """).fetchone()
     np.testing.assert_allclose(yhat,beta*x_scale*.5,rtol=1e-6,atol=0)
     np.testing.assert_allclose(se,np.sqrt(variance),rtol=1e-6,atol=0)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+def test_small_unit_concentrated_bse_at_zero_coefficient(con, out_of_core):
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_zero_beta AS
+        SELECT t, CASE WHEN t%2=0 THEN 1e0 ELSE -1e0 END AS x, 1e-10 AS y
+        FROM range(1,41) a(t)
+    """)
+    rows = con.execute("""
+        SELECT kind,value FROM sarimax_fit('boundary_zero_beta','y',0,0,0,
+            exog_cols:=['x'],t_col:='t',concentrate:=true,out_of_core:=?)
+        WHERE name='x' AND kind IN ('param','bse')
+    """, [out_of_core]).fetchall()
+    result = dict(rows)
+    np.testing.assert_allclose(result['param'],0,atol=1e-18)
+    np.testing.assert_allclose(result['bse'],1e-10/np.sqrt(40),rtol=1e-3,atol=0)

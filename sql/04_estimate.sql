@@ -3093,6 +3093,19 @@ CREATE OR REPLACE MACRO _sarimax_information_bse(info, n) AS (
     END
 );
 
+-- A mean-coordinate probe must stay local at small coefficient units,
+-- especially for concentrated likelihoods whose curvature is not quadratic
+-- far from the optimum. Noise standard deviation / design magnitude gives
+-- a coefficient scale even when the fitted coefficient is exactly zero.
+-- Preserve the established floors for ordinary units and diffuse models.
+CREATE OR REPLACE MACRO _sarimax_bse_mean_floors(scale2, magnitudes, enabled) AS (
+    list_transform(magnitudes, lambda magnitude:
+        (list_transform([sqrt(scale2) / nullif(magnitude, 0e0)], lambda unit:
+            CASE WHEN enabled AND isfinite(unit) AND unit > 0e0
+                      AND (unit < 1e-3 OR unit > 1e3)
+                 THEN 1e-1 * unit ELSE 1e-1 END))[1])
+);
+
 CREATE OR REPLACE MACRO _sarimax_bse_v2(params, ylist, xmat, degs,
                                         r, p, q, bigp, bigq, s, d, sd,
                                         ktrend, conc) AS TABLE
@@ -3101,11 +3114,19 @@ WITH _sarimax_bs2_in0 AS (
            (ktrend + r + p + q + bigp + bigq
             + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp
 ),
-_sarimax_bs2_in AS (
-    SELECT zc, zwl, zxm, zdg, znp,
-           (_sarimax_ll_c_v2(zc, zwl, zxm, zdg, r, p, q, bigp, bigq, s, d, sd,
-                             ktrend, conc)).ll AS zf0
+_sarimax_bs2_eval AS (
+    SELECT *, _sarimax_ll_c_v2(zc, zwl, zxm, zdg, r, p, q, bigp, bigq, s, d, sd,
+                               ktrend, conc) AS zfit
     FROM _sarimax_bs2_in0
+),
+_sarimax_bs2_in AS (
+    SELECT zc, zwl, zxm, zdg, znp, zfit.ll AS zf0,
+           _sarimax_bse_mean_floors(zfit.scale2,
+               list_transform(zdg, lambda degree: pow(len(zwl)::DOUBLE, degree))
+               || list_transform(range(1,r+1), lambda j:
+                      list_max(list_transform(zxm, lambda row: abs(row[j])))),
+               d + sd = 0) AS zfloors
+    FROM _sarimax_bs2_eval
 ),
 _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
     SELECT zin.zc, zin.zwl, zin.zxm, zin.zdg, zin.znp, zin.zf0, zhh.zhl
@@ -3117,7 +3138,7 @@ _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
                    (list_transform([(CASE WHEN d + s * sd > 0 THEN 1e-3 ELSE 1e-4 END)
                                     * CASE WHEN NOT conc AND zi = len(zcc)
                                            THEN abs(zcc[zi])
-                                           ELSE greatest(1e-1, abs(zcc[zi])) END], lambda zh0:
+                                           ELSE greatest(coalesce(zfloorc[zi],1e-1), abs(zcc[zi])) END], lambda zh0:
                         CASE WHEN (_sarimax_ll_c_v2(list_transform(zcc, lambda zv2, zi2:
                                       CASE WHEN zi2 = zi THEN zv2 + zh0 ELSE zv2 END),
                                       zwlc, zxmc, zdgc, r, p, q, bigp, bigq, s, d, sd,
@@ -3138,7 +3159,7 @@ _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
                              THEN zh0 * 5e-1
                              ELSE zh0 * 25e-2 END))[1] AS zh
             FROM (SELECT zin.zc AS zcc, zin.zwl AS zwlc, zin.zxm AS zxmc,
-                         zin.zdg AS zdgc, zu.zi
+                         zin.zdg AS zdgc, zin.zfloors AS zfloorc, zu.zi
                   FROM unnest(range(1, zin.znp + 1)) AS zu(zi))
         )
     ) zhh
@@ -3213,12 +3234,23 @@ WITH _sarimax_bs2_in0 AS (
            (ktrend + r + p + q + bigp + bigq
             + CASE WHEN conc THEN 0 ELSE 1 END)::BIGINT AS znp
 ),
-_sarimax_bs2_in AS (
-    SELECT zc, znp,
-           (_sarimax_ll_c_ooc_v2(zc, y_tbl, exog_tbl, degs_tbl,
-                                 r, p, q, bigp, bigq, s, d, sd,
-                                 ktrend, conc)).ll AS zf0
+_sarimax_bs2_eval AS (
+    SELECT *, _sarimax_ll_c_ooc_v2(zc, y_tbl, exog_tbl, degs_tbl,
+                                   r, p, q, bigp, bigq, s, d, sd,
+                                   ktrend, conc) AS zfit
     FROM _sarimax_bs2_in0
+),
+_sarimax_bs2_in AS (
+    SELECT zc, znp, zfit.ll AS zf0,
+           _sarimax_bse_mean_floors(zfit.scale2,
+               coalesce((SELECT list(pow((SELECT count(*) FROM query_table(y_tbl))::DOUBLE,
+                                        degree) ORDER BY idx) FROM query_table(degs_tbl)),
+                        []::DOUBLE[])
+               || coalesce((SELECT list(magnitude ORDER BY j)
+                            FROM (SELECT j,max(abs(x)) AS magnitude
+                                  FROM query_table(exog_tbl) GROUP BY j)), []::DOUBLE[]),
+               d + sd = 0) AS zfloors
+    FROM _sarimax_bs2_eval
 ),
 _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
     SELECT zin.zc, zin.znp, zin.zf0, zhh.zhl
@@ -3258,7 +3290,7 @@ _sarimax_bs2_h AS (       -- adaptive per-coordinate steps
                          (CASE WHEN d + s * sd > 0 THEN 1e-3 ELSE 1e-4 END)
                          * CASE WHEN NOT conc AND zu.zi = zin.znp
                                 THEN abs(zin.zc[zu.zi])
-                                ELSE greatest(1e-1, abs(zin.zc[zu.zi])) END AS zh0
+                                ELSE greatest(coalesce(zin.zfloors[zu.zi],1e-1), abs(zin.zc[zu.zi])) END AS zh0
                   FROM unnest(range(1, zin.znp + 1)) AS zu(zi))
         )
     ) zhh
