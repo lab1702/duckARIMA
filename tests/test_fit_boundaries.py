@@ -146,3 +146,22 @@ def test_concentrated_ar_boundary_bse_does_not_abort_fit(con, out_of_core):
     assert np.isfinite(fits[1][('meta','loglik')])
     for key in [('meta','loglik'), ('param','ar.L1')]:
         np.testing.assert_allclose(fits[1][key], fits[0][key], rtol=1e-12)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("d,sd,s,value", [(0,0,1,0), (1,0,1,7), (0,1,4,7)])
+@pytest.mark.parametrize("missing", [False, True])
+def test_zero_variance_white_noise_rejected(con, out_of_core, concentrate,
+                                           d, sd, s, value, missing):
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_zero AS
+        SELECT t, CASE WHEN ? AND t=10 THEN NULL ELSE ?::DOUBLE END AS y
+        FROM range(1,31) a(t)
+    """, [missing, value])
+    with pytest.raises(duckdb.Error, match="zero-variance white-noise"):
+        con.execute("""
+            SELECT * FROM sarimax_fit('boundary_zero','y',0,?,0,
+                sd:=?,s:=?,out_of_core:=?,concentrate:=?,t_col:='t',
+                compute_bse:=false)
+        """, [d,sd,s,out_of_core,concentrate]).fetchall()

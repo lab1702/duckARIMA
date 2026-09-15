@@ -226,6 +226,8 @@ All failures raise immediately with a message naming the offender:
   threshold (1e-10 × trace) — a constant column under differencing is the
   canonical rejection, reported by column;
 - too few usable observations after burn-in for the mean and ARMA parameters,
+- all-zero model-scale observations for a zero-mean white-noise model (including
+  zeros produced by simple differencing), which have no finite positive-variance optimum,
   or a series too short for the Hannan–Rissanen start-value regressions
   (including regression and trend dimensions; the required minimum is stated
   in the error);

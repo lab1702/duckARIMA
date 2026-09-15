@@ -124,7 +124,8 @@ def test_fit_rejects_nonfinite_optimum(con, out_of_core, projection, value):
                 "FROM range(1,31) q(t)")
     columns = "value" if projection == "spec" else projection
     suffix = " WHERE kind='spec'" if projection == "spec" else ""
-    with pytest.raises(duckdb.Error, match="non-finite loglikelihood"):
+    message = "zero-variance white-noise" if value == "0e0" else "non-finite loglikelihood"
+    with pytest.raises(duckdb.Error, match=message):
         con.execute(f"SELECT {columns} FROM sarimax_fit('poisoned','y',0,0,0,"
                     "concentrate := true,compute_bse := false,t_col := 't',"
                     f"out_of_core := {out_of_core})" + suffix).fetchall()
