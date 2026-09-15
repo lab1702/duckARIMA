@@ -6,7 +6,8 @@ UDFs, no driver required: everything runs inside a stock DuckDB
 session, from the CLI or any client.
 
 Validated against statsmodels' `SARIMAX` on committed golden fixtures at
-honest tolerances: the Kalman-filter **loglikelihood reproduces statsmodels
+documented tolerances: with stationary initialization, the Kalman-filter
+**loglikelihood reproduces statsmodels
 to near machine precision at fixed parameters** (abs ≤ 1e-8 / rel ≤ 1e-10,
 with per-timestep innovations at rel ≤ 1e-9); **fitted parameters and
 forecasts agree to optimizer tolerance** (parameters abs ≤ 1e-6, forecasts
@@ -14,6 +15,12 @@ rel ≤ 1e-6, forecast standard errors rel ≤ 1e-5, parameter standard errors
 rel ≤ 1e-3). The argmax of a likelihood is only defined to optimizer
 tolerance — in statsmodels as much as here — so no blanket
 "machine precision" claim is made for the fit itself.
+
+Integrated models with `simple_differencing := false` use approximate-diffuse
+initialization and have larger, model-dependent floating-point differences.
+The v2 fixture tests use explicitly documented per-fixture tolerances; the
+strict stationary tolerances above are not a general accuracy guarantee for
+that mode. See `GUIDE.md` and `tests/test_filter_v2.py` for the distinction.
 
 ## Setup
 

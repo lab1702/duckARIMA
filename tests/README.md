@@ -31,6 +31,10 @@ The out-of-core checks above validate individual stages and a 30-row public
 fit. They do not establish a complete larger-than-memory fit or its required
 memory budget. V2 public forecasts are also compared with live statsmodels
 forecasts at the SQL fit's parameters on every optimizer acceptance path.
+The strict stationary T1 tolerances do not apply uniformly to approximate-
+diffuse integrated models. `test_filter_v2.py` documents the existing
+per-fixture deviations and tolerances; they are not general bounds for
+untested combinations of differencing orders.
 
 ## 2. The pure-SQL smoke path (no Python)
 

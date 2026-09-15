@@ -160,6 +160,14 @@ implementation:
   first burn = d + s·D innovations are therefore excluded from the
   loglikelihood (`loglikelihood_burn`), and AIC/BIC use
   nobs_effective = n − burn.
+- **Numerical accuracy.** Approximate-diffuse initialization can amplify
+  floating-point differences between the SQL recursion and statsmodels.
+  The stationary filter's strict T1 tolerances do not extend to all integrated
+  models in this mode. The v2 tests document fixture-specific tolerances in
+  `tests/test_filter_v2.py`; these are measured cases, not bounds for arbitrary
+  orders. Higher combined ordinary and seasonal differencing can exceed the
+  stationary targets even with a small state vector. Compare representative
+  fixed-parameter likelihoods and forecasts when precision in this mode matters.
 - **Forecasting needs no anchors.** The model scale IS the original scale:
   forecasts come straight from the state recursion (no integration step,
   `yhat = yhat_diff`), and future exog enter raw.
@@ -226,8 +234,9 @@ All failures raise immediately with a message naming the offender:
   because every accumulation on the likelihood path is an ordered fold.
 - Performance: one likelihood evaluation for n = 500, k = 14 runs in well
   under a second; a full airline-benchmark fit is minutes, not hours. State
-  dimension k = max(p + s·P, q + s·Q + 1) drives cost — k ≤ 16 is the tested
-  envelope.
+  dimension drives cost: k = max(p + s·P, q + s·Q + 1), plus d + s·D when
+  simple differencing is disabled. Fixture coverage includes states up to
+  k = 27; state size alone does not establish a numerical accuracy envelope.
 - The library never creates or drops tables; every macro is a pure query over
   its inputs. Names beginning `_sarimax_` (macros, CTEs, columns) are
   reserved.
