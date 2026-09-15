@@ -168,6 +168,28 @@ def test_zero_variance_white_noise_rejected(con, out_of_core, concentrate,
 
 @pytest.mark.parametrize("out_of_core", [False, True])
 @pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("trend", ["c", "ct"])
+@pytest.mark.parametrize("simple_differencing", [False, True])
+@pytest.mark.parametrize("missing", [False, True])
+def test_constant_mean_zero_variance_rejected(con, out_of_core, concentrate,
+                                              trend, simple_differencing, missing):
+    # A fitted intercept absorbs the entire series: the positive-variance
+    # likelihood is unbounded, even with more observations than parameters.
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_constant AS
+        SELECT t, CASE WHEN ? AND t=10 THEN NULL ELSE 7e0 END AS y
+        FROM range(1,31) a(t)
+    """, [missing])
+    with pytest.raises(duckdb.Error, match="zero-variance white-noise"):
+        con.execute("""
+            SELECT * FROM sarimax_fit('boundary_constant','y',0,0,0,
+                trend:=?,simple_differencing:=?,out_of_core:=?,
+                concentrate:=?,t_col:='t')
+        """, [trend,simple_differencing,out_of_core,concentrate]).fetchall()
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
 @pytest.mark.parametrize("missing", [False, True])
 def test_large_unit_constant_mean_matches_analytic_fit(con, out_of_core,
                                                       concentrate, missing):

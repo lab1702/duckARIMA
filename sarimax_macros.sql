@@ -7122,9 +7122,11 @@ _sarimax_f_model_chk AS MATERIALIZED (
                          len(exog_cols) + len(_sarimax_trend_degrees(trend)) + p + q + sp + sq + 1,
                          ' for the requested mean and ARMA parameters'))
              WHEN p + q + sp + sq = 0 AND len(exog_cols) = 0
-                  AND len(_sarimax_trend_degrees(trend)) = 0
                   AND (simple_differencing OR _sarimax_kdiff(d, sd, s) = 0)
-                  AND (SELECT bool_and(y = 0e0) FROM _sarimax_f_y_unchecked)
+                  AND ((trend = 'n'
+                        AND (SELECT bool_and(y = 0e0) FROM _sarimax_f_y_unchecked))
+                       OR (trend IN ('c', 'ct')
+                           AND (SELECT min(y) = max(y) FROM _sarimax_f_y_unchecked)))
                THEN error('sarimax: zero-variance white-noise series has no finite variance optimum')
              ELSE true
            END AS ok
