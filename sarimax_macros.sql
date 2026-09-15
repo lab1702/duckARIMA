@@ -4897,7 +4897,7 @@ CREATE OR REPLACE MACRO _sarimax_ll_mean_v2(gains, ydlist, clist) AS (
 -- (31 rejected candidates down to alpha = 2^-30) or a
 -- machine-epsilon-flat accepted step, and the acceptance suite separately
 -- asserts ll >= statsmodels' ll - 1e-8 at the endpoint.
-CREATE OR REPLACE MACRO _sarimax_bfgs_v2(y_tbl, exog_tbl, degs_tbl,
+CREATE OR REPLACE MACRO _sarimax_bfgs_core_v2(y_tbl, exog_tbl, degs_tbl,
                                          r, p, q, bigp, bigq, s, d, sd,
                                          ktrend, conc, out_of_core := false) AS TABLE
 WITH RECURSIVE
@@ -5561,6 +5561,68 @@ SELECT zit.zx AS x_opt,
        zit.zrestarted AS restarted,
        zit.zlsf AS ls_failures
 FROM _sarimax_bf2_final zit, _sarimax_bf2_pc zpc;
+
+-- Stationary regression fits at extreme units need dimensionless inputs:
+-- otherwise a finite-difference probe at beta=0 can leave the objective
+-- unchanged and falsely certify convergence. Scale with streaming maxima,
+-- preserving the relational execution path. Unit-scale fits retain their
+-- original numerical path. Diffuse integrated models retain their original
+-- units because their fixed initial covariance is not scale-equivariant.
+CREATE OR REPLACE MACRO _sarimax_bfgs_v2(y_tbl, exog_tbl, degs_tbl,
+                                         r, p, q, bigp, bigq, s, d, sd,
+                                         ktrend, conc, out_of_core := false) AS TABLE
+WITH _sarimax_units_ymax AS (
+    SELECT max(abs(y)) AS magnitude, count(y) AS nobs FROM query_table(y_tbl)
+),
+_sarimax_units_xmax AS (
+    SELECT j, max(abs(x)) AS magnitude FROM query_table(exog_tbl) GROUP BY j
+),
+_sarimax_units_gate AS (
+    SELECT r > 0 AND d + sd = 0 AND
+           (ym.magnitude > 1e3 OR (ym.magnitude > 0e0 AND ym.magnitude < 1e-3)
+            OR coalesce((SELECT bool_or(magnitude > 1e3
+                                OR (magnitude > 0e0 AND magnitude < 1e-3))
+                         FROM _sarimax_units_xmax), false)) AS enabled,
+           ym.nobs, ym.magnitude
+    FROM _sarimax_units_ymax ym
+),
+_sarimax_units_scale AS (
+    SELECT CASE WHEN enabled AND magnitude > 0e0 THEN magnitude ELSE 1e0 END AS ys,
+           coalesce((SELECT list(CASE WHEN ug.enabled AND xm.magnitude > 0e0
+                                     THEN xm.magnitude ELSE 1e0 END ORDER BY j)
+                     FROM _sarimax_units_xmax xm), []::DOUBLE[]) AS xs,
+           nobs
+    FROM _sarimax_units_gate ug
+),
+_sarimax_units_y AS (
+    SELECT t, y / us.ys AS y FROM query_table(y_tbl), _sarimax_units_scale us
+),
+_sarimax_units_x AS (
+    SELECT t, j, x / us.xs[j] AS x FROM query_table(exog_tbl), _sarimax_units_scale us
+),
+_sarimax_units_fit AS MATERIALIZED (
+    SELECT * FROM _sarimax_bfgs_core_v2('_sarimax_units_y', '_sarimax_units_x', degs_tbl,
+                                        r, p, q, bigp, bigq, s, d, sd,
+                                        ktrend, conc, out_of_core)
+),
+_sarimax_units_params AS (
+    SELECT uf.* EXCLUDE (params, x_opt),
+           list_transform(uf.x_opt, lambda value, idx:
+               CASE WHEN idx <= ktrend THEN value * us.ys
+                    WHEN idx <= ktrend + r THEN value * us.ys / us.xs[idx-ktrend]
+                    WHEN NOT conc AND idx = len(uf.x_opt) THEN value * us.ys
+                    ELSE value END) AS x_opt,
+           list_transform(uf.params, lambda value, idx:
+               CASE WHEN idx <= ktrend THEN value * us.ys
+                    WHEN idx <= ktrend + r THEN value * us.ys / us.xs[idx-ktrend]
+                    WHEN NOT conc AND idx = len(uf.params) THEN value * us.ys * us.ys
+                    ELSE value END) AS params,
+           us.ys, us.nobs
+    FROM _sarimax_units_fit uf, _sarimax_units_scale us
+)
+SELECT x_opt, params, loglik - nobs * ln(ys) AS loglik, scale2 * ys * ys AS scale2,
+       converged, iterations, grad_norm, restarted, ls_failures
+FROM _sarimax_units_params;
 
 -- ---- 3e. standard errors (v2 objective; v1 section 2d semantics) ---------------
 

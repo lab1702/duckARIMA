@@ -108,6 +108,12 @@ behavior", recorded here so nothing is implicit in code:
    retained point before claiming convergence there. If the returned point
    cannot be certified, `converged` remains false. The reported gradient belongs
    to the returned parameters, while counters describe the attempted run.
+   Stationary regression fits normalize target and regressor magnitudes when
+   any nonzero maximum absolute value falls outside `[1e-3, 1e3]`. Their
+   `grad_norm` uses these normalized optimizer coordinates; coefficients,
+   variance, likelihood and forecasts retain the original units. Models
+   with integration inside the state vector retain their original units
+   because their fixed diffuse initial covariance is not scale-equivariant.
 10. **Seasonal argument names**: `sp/sd/sq` stand in for P/D/Q because DuckDB
     macro parameters are case-insensitive.
 11. **Re-supplying `exog_cols`**: the forecast/diagnostics macros take the
@@ -227,7 +233,8 @@ All failures raise immediately with a message naming the offender:
   canonical rejection, reported by column;
 - too few usable observations after burn-in for the mean and ARMA parameters,
 - all-zero model-scale observations for a zero-mean white-noise model (including
-  zeros produced by simple differencing), which have no finite positive-variance optimum,
+  zeros produced by simple differencing), or constant observations with a fitted
+  constant mean and no exogenous regressors, which have no finite positive-variance optimum,
   or a series too short for the Hannan–Rissanen start-value regressions
   (including regression and trend dimensions; the required minimum is stated
   in the error);

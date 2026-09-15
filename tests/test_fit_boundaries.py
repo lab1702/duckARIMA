@@ -215,3 +215,38 @@ def test_large_unit_constant_mean_matches_analytic_fit(con, out_of_core,
         SELECT yhat FROM sarimax_forecast('boundary_mean_model','boundary_mean','y',3,t_col:='t')
     """).fetchnumpy()['yhat']
     np.testing.assert_allclose(forecast,np.nanmean(y),rtol=1e-10)
+
+
+@pytest.mark.parametrize("out_of_core", [False, True])
+@pytest.mark.parametrize("concentrate", [False, True])
+@pytest.mark.parametrize("y_scale,x_scale", [(1e10,1.), (1.,1e-10),
+                                            (1e-10,1.), (1.,1e10)])
+def test_regression_fit_preserves_units(con, out_of_core, concentrate,
+                                       y_scale, x_scale):
+    t = np.arange(1.,41.)
+    x = x_scale*np.sin(.4*t)
+    y = y_scale*(2*np.sin(.4*t)+np.cos(1.7*t))
+    beta = np.dot(x,y)/np.dot(x,x)
+    variance = np.mean((y-beta*x)**2)
+    expected_ll = -.5*len(y)*(np.log(2*np.pi*variance)+1)
+    con.execute("CREATE OR REPLACE TABLE boundary_units(t BIGINT,x DOUBLE,y DOUBLE)")
+    con.executemany("INSERT INTO boundary_units VALUES (?,?,?)",
+                    [(i,float(xv),float(yv)) for i,(xv,yv) in enumerate(zip(x,y),1)])
+    con.execute("""
+        CREATE OR REPLACE TABLE boundary_units_model AS
+        SELECT * FROM sarimax_fit('boundary_units','y',0,0,0,exog_cols:=['x'],
+            t_col:='t',out_of_core:=?,concentrate:=?,compute_bse:=false)
+    """, [out_of_core,concentrate])
+    meta = dict(con.execute("SELECT name,value FROM boundary_units_model WHERE kind='meta'").fetchall())
+    actual_beta = con.execute("SELECT value FROM boundary_units_model WHERE kind='param' AND name='x'").fetchone()[0]
+    assert meta['converged'] == 1
+    np.testing.assert_allclose(actual_beta,beta,rtol=1e-6,atol=0)
+    np.testing.assert_allclose(meta['sigma2'],variance,rtol=1e-6,atol=0)
+    np.testing.assert_allclose(meta['loglik'],expected_ll,rtol=1e-9,atol=1e-8)
+    con.execute("CREATE OR REPLACE TABLE boundary_units_future AS SELECT 41 AS t, ? AS x", [x_scale*.5])
+    yhat,se = con.execute("""
+        SELECT yhat,se FROM sarimax_forecast('boundary_units_model','boundary_units','y',1,
+            t_col:='t',newdata:='boundary_units_future',exog_cols:=['x'])
+    """).fetchone()
+    np.testing.assert_allclose(yhat,beta*x_scale*.5,rtol=1e-6,atol=0)
+    np.testing.assert_allclose(se,np.sqrt(variance),rtol=1e-6,atol=0)
