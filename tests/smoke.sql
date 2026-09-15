@@ -6,6 +6,8 @@
 -- NOTE: committed in deliberately FAILING form before the library exists
 -- (spec section 12: both test paths run red from day one).
 
+.bail on
+
 SET lambda_syntax = 'DISABLE_SINGLE_ARROW';
 
 .read sarimax_macros.sql
@@ -44,18 +46,18 @@ SELECT * FROM sarimax_fit('smoke_data', 'y', 1, 1, 1, exog_cols := ['x1', 'x2'],
 
 -- invariant: converged, finite loglik
 SELECT CASE
-    WHEN (SELECT value FROM smoke_model WHERE kind = 'meta' AND name = 'converged') <> 1.0::DOUBLE
+    WHEN (SELECT value FROM smoke_model WHERE kind = 'meta' AND name = 'converged') IS DISTINCT FROM 1.0::DOUBLE
     THEN error('smoke: fit did not converge')
     ELSE 'SMOKE OK: converged' END AS check_1;
 
 SELECT CASE
-    WHEN NOT isfinite((SELECT value FROM smoke_model WHERE kind = 'meta' AND name = 'loglik'))
+    WHEN isfinite((SELECT value FROM smoke_model WHERE kind = 'meta' AND name = 'loglik')) IS NOT TRUE
     THEN error('smoke: loglik not finite')
     ELSE 'SMOKE OK: finite loglik' END AS check_2;
 
 -- invariant: sigma2 strictly positive
 SELECT CASE
-    WHEN (SELECT value FROM smoke_model WHERE kind = 'param' AND name = 'sigma2') <= 0.0::DOUBLE
+    WHEN (isfinite((SELECT value FROM smoke_model WHERE kind = 'param' AND name = 'sigma2')) AND (SELECT value FROM smoke_model WHERE kind = 'param' AND name = 'sigma2') > 0.0::DOUBLE) IS NOT TRUE
     THEN error('smoke: sigma2 not positive')
     ELSE 'SMOKE OK: sigma2 > 0' END AS check_3;
 
@@ -73,12 +75,13 @@ SELECT CASE
 -- invariant: interval ordering lo < mean < hi, finite everywhere, widening se
 SELECT CASE
     WHEN (SELECT count(*) FROM smoke_fc
-          WHERE NOT (isfinite(yhat) AND isfinite(se) AND lo < yhat AND yhat < hi)) > 0
+          WHERE (isfinite(yhat) AND isfinite(se) AND isfinite(lo) AND isfinite(hi)
+                 AND se > 0 AND lo < yhat AND yhat < hi) IS NOT TRUE) > 0
     THEN error('smoke: broken forecast interval ordering')
     ELSE 'SMOKE OK: interval ordering' END AS check_5;
 
 SELECT CASE
-    WHEN (SELECT se FROM smoke_fc WHERE h = 1) > (SELECT se FROM smoke_fc WHERE h = 12)
+    WHEN ((SELECT se FROM smoke_fc WHERE h = 1) <= (SELECT se FROM smoke_fc WHERE h = 12)) IS NOT TRUE
     THEN error('smoke: forecast se should not shrink with horizon for an I(1) model')
     ELSE 'SMOKE OK: se growth' END AS check_6;
 
@@ -89,7 +92,7 @@ SELECT CASE
     ELSE 'SMOKE OK: summary rows' END AS check_7;
 
 SELECT CASE
-    WHEN NOT isfinite((SELECT aic FROM sarimax_evaluate('smoke_model', 'smoke_data', 'y', exog_cols := ['x1', 'x2'], t_col := 't')))
+    WHEN isfinite((SELECT aic FROM sarimax_evaluate('smoke_model', 'smoke_data', 'y', exog_cols := ['x1', 'x2'], t_col := 't'))) IS NOT TRUE
     THEN error('smoke: aic not finite')
     ELSE 'SMOKE OK: evaluate' END AS check_8;
 
@@ -102,12 +105,12 @@ SELECT * FROM sarimax_fit('smoke_data', 'y', 1, 1, 1, exog_cols := ['x1', 'x2'],
                           trend := 'ct', concentrate := true, simple_differencing := false);
 
 SELECT CASE
-    WHEN (SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'converged') <> 1.0::DOUBLE
+    WHEN (SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'converged') IS DISTINCT FROM 1.0::DOUBLE
     THEN error('smoke v2: fit did not converge')
     ELSE 'SMOKE OK: v2 converged' END AS check_v2_1;
 
 SELECT CASE
-    WHEN NOT isfinite((SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'loglik'))
+    WHEN isfinite((SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'loglik')) IS NOT TRUE
     THEN error('smoke v2: loglik not finite')
     ELSE 'SMOKE OK: v2 finite loglik' END AS check_v2_2;
 
@@ -116,10 +119,10 @@ SELECT CASE
 SELECT CASE
     WHEN (SELECT count(*) FROM smoke_model_v2 WHERE kind = 'param' AND name = 'sigma2') <> 0
     THEN error('smoke v2: concentrated fit must not report a sigma2 param row')
-    WHEN (SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'sigma2') <= 0.0::DOUBLE
+    WHEN (isfinite((SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'sigma2')) AND (SELECT value FROM smoke_model_v2 WHERE kind = 'meta' AND name = 'sigma2') > 0.0::DOUBLE) IS NOT TRUE
     THEN error('smoke v2: concentrated scale not positive')
-    WHEN (SELECT name FROM smoke_model_v2 WHERE kind = 'param' AND idx = 1) <> 'intercept'
-      OR (SELECT name FROM smoke_model_v2 WHERE kind = 'param' AND idx = 2) <> 'drift'
+    WHEN (SELECT name FROM smoke_model_v2 WHERE kind = 'param' AND idx = 1) IS DISTINCT FROM 'intercept'
+      OR (SELECT name FROM smoke_model_v2 WHERE kind = 'param' AND idx = 2) IS DISTINCT FROM 'drift'
     THEN error('smoke v2: trend params must lead the parameter order')
     ELSE 'SMOKE OK: v2 param layout' END AS check_v2_3;
 
@@ -135,7 +138,8 @@ SELECT CASE
 
 SELECT CASE
     WHEN (SELECT count(*) FROM smoke_fc_v2
-          WHERE NOT (isfinite(yhat) AND isfinite(se) AND lo < yhat AND yhat < hi)) > 0
+          WHERE (isfinite(yhat) AND isfinite(se) AND isfinite(lo) AND isfinite(hi)
+                 AND se > 0 AND lo < yhat AND yhat < hi) IS NOT TRUE) > 0
     THEN error('smoke v2: broken forecast interval ordering')
     ELSE 'SMOKE OK: v2 interval ordering' END AS check_v2_5;
 
