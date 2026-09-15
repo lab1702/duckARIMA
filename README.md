@@ -54,13 +54,14 @@ CREATE TABLE m2 AS SELECT * FROM sarimax_fit('sales', 'units', 1, 1, 1,
                                              simple_differencing := false);
 ```
 
-## Larger-than-memory fitting
+## Relational fitting and memory limits
 
 DuckDB can spill relational sorts, joins, windows, and hash aggregates to a
 temporary directory.  The regular fit path intentionally packs the timeline
 into ordered `LIST` values for speed and bitwise determinism; DuckDB cannot
-spill those aggregate states.  Select the relational likelihood explicitly
-when the series may not fit in memory:
+spill those aggregate states. The alternative relational likelihood avoids
+packing the full timeline, but complete larger-than-memory fitting has not
+been validated. Select it explicitly with:
 
 ```sql
 SET memory_limit = '8GB';
@@ -83,11 +84,14 @@ settings remain session-level and caller-controlled.  `compute_bse := false`
 skips the numerical Hessian's O(parameter_count²) full-data passes and emits
 NULL standard errors; it does not change fitted coefficients or forecasts.
 
-This is a correctness-first escape hatch, not a promise that very long fits
-will be fast: BFGS still needs many sequential O(n·state_dimension³) filter
-passes.  The residual, evaluation, and Ljung–Box helpers retain full-trace or
-whole-series intermediates and are not yet covered by the out-of-core
-contract.  See `GUIDE.md` for tuning, determinism, and verification details.
+Validation covers external spill during ordering, initialization below the
+input-sized `LIST` memory requirement, a 2,000-row filter at 20 MB, and a small
+complete public fit. These stage checks do not guarantee a complete fit within
+the same memory budget. The recursive relational filter also rescans observations
+per timestep, producing quadratic scan work; BFGS repeats that work for many
+likelihood evaluations. Residual, evaluation, and Ljung–Box helpers retain
+full-trace or whole-series intermediates. See `GUIDE.md` for the validation
+scope and `PERFORMANCE.md` for measured scaling limitations.
 
 Note: the seasonal orders are `sp` (seasonal AR), `sd` (seasonal
 differencing), `sq` (seasonal MA) — DuckDB macro parameters are

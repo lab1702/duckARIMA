@@ -234,7 +234,7 @@ All failures raise immediately with a message naming the offender:
 - Missing values: NULL y is supported (see section 5); NULL exog is not
   (statsmodels-parity choice).
 
-### Larger-than-memory mode
+### Relational mode and validated memory scope
 
 The default optimizer uses whole-series ordered `LIST` folds. They make its
 floating-point path bitwise deterministic and are substantially faster for
@@ -250,6 +250,14 @@ explicit **unique** `t_col` is mandatory. In particular, do not combine
 `preserve_insertion_order = false` with the implicit `t_col := NULL` order:
 endog and exog are separate scans and unordered SQL results have no stable
 natural order.
+
+The option name does not guarantee complete larger-than-memory fitting.
+Committed tests demonstrate external spill during ordering, initialization
+below the input-sized `LIST` memory requirement, and a 2,000-row filter under
+a 20 MB limit. The complete public fit is tested on 30 rows. Those independent
+stage checks do not establish the memory budget required by a full optimizer
+run; validate that run with representative data and session settings before
+relying on it for a larger-than-memory workload.
 
 The uniqueness check shares the native-type window-sort strategy rather than
 building a whole-key `DISTINCT` aggregate, so that validation can also use the
@@ -289,13 +297,15 @@ It leaves the model's `bse` values NULL and skips the central-difference
 Hessian, whose O(k_params²) likelihood probes can dominate the fit. This
 does not affect parameters, stored state, evaluation criteria, or forecasts.
 
-Memory-bounded does not mean cheap: every likelihood is still a sequential
-O(n * state_dimension^3) recursion, and BFGS performs many likelihoods.
+Every likelihood uses a sequential Kalman recursion. In addition to its matrix
+arithmetic, the relational implementation rescans the observation CTE per
+timestep, causing quadratic observation scan work. BFGS performs many such
+likelihood evaluations; see `PERFORMANCE.md` for measured limitations.
 Binding and planning the pure-SQL optimizer can also have noticeable fixed
 startup latency before the first data pass.
 At million-row scale a native Kalman extension will usually be operationally
-preferable. The current out-of-core contract covers `sarimax_fit`; residual,
-evaluation, and Ljung–Box queries still retain a full trace or whole-series
+preferable. Full-fit larger-than-memory behavior remains unvalidated; residual,
+evaluation, and Ljung–Box queries also retain a full trace or whole-series
 intermediates. DuckDB's
 [`verify_external`](https://duckdb.org/docs/current/configuration/pragmas#verification)
 and JSON profiling metrics (`SYSTEM_PEAK_TEMP_DIR_SIZE`) can be used to prove

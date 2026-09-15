@@ -27,6 +27,11 @@ python -m venv .venv && .venv/Scripts/pip install --upgrade -r tests/requirement
 | `test_out_of_core.py` | relational fit path | native time-key ordering, scalar-vs-relational likelihood and Hessian parity paths, explicit unique-time/NULL-exog validation, public `out_of_core` fit without Hessian, a 20 MB keyed-filter regression, and profiled external spill where the input-sized `LIST` path fails |
 | `test_live.py` | all layers | **live cross-check**: references recomputed against statsmodels in-process on fixed-seed data at fixed parameters (transform, ssm, filter trace, loglik, forecasts both scales) — guards against environment drift independently of the frozen fixtures |
 
+The out-of-core checks above validate individual stages and a 30-row public
+fit. They do not establish a complete larger-than-memory fit or its required
+memory budget. V2 public forecasts are also compared with live statsmodels
+forecasts at the SQL fit's parameters on every optimizer acceptance path.
+
 ## 2. The pure-SQL smoke path (no Python)
 
 ```

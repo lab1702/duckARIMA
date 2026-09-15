@@ -35,7 +35,8 @@ table** — materialize it: `CREATE TABLE m AS SELECT * FROM sarimax_fit(...)`.
 - `out_of_core` — use the relational, spill-compatible likelihood instead of
   the faster whole-series `LIST` kernel. Requires an explicit unique `t_col`.
   Configure `memory_limit`, `temp_directory`, and `max_temp_directory_size`
-  on the DuckDB session before fitting.
+  on the DuckDB session before fitting. Spill and low-memory validation cover
+  individual stages; a complete larger-than-memory fit is not guaranteed.
 - `compute_bse` — compute numerical-Hessian standard errors (default true).
   Set false for large fits to avoid O(parameter_count²) extra full-data
   likelihood passes; `bse` rows are retained with NULL values.

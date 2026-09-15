@@ -14,9 +14,10 @@ Groups:
                     through the same v2 engine (dll > 1e-8) -- re-baselining;
        - "ll_tie":  |dll| <= 1e-8 with params within 1e-3.
      In all paths our loglik must not be materially worse than statsmodels'
-     reported optimum (>= sm - 1e-8). Forecasts are compared at rel tolerance
-     (mean 1e-6, se 1e-5) only when the "params" path was taken; otherwise the
-     optima differ so only sanity (finite, lo < yhat < hi) is asserted.
+     reported optimum (>= sm - 1e-8). Golden forecasts are compared at rel
+     tolerance (mean 1e-6, se 1e-5) only on the "params" path; otherwise the
+     optima differ. Every path also compares forecasts with a live statsmodels
+     filter evaluated at the parameters returned by our fit.
      AIC/BIC: k counts sigma2 even when concentrated and the BIC n is
      nobs_effective = n_eff - burn (both pinned by fixtures_v2 fitted_meta).
   3. v1 public-path regression: arma_1_0_1 (a v1 fixture) fit through the NEW
@@ -30,6 +31,7 @@ import duckdb
 import numpy as np
 import pandas as pd
 import pytest
+from statsmodels.tsa.statespace.sarimax import SARIMAX
 
 HERE = os.path.dirname(os.path.abspath(__file__))
 ROOT = os.path.dirname(HERE)
@@ -297,6 +299,29 @@ def test_v2_public_forecast(con, fx):
                 / np.abs(fcfix["se_orig"].to_numpy())).max()
         assert relm <= 1e-6, f"{fx}: forecast mean rel err {relm:.3e}"
         assert rels <= 1e-5, f"{fx}: forecast se rel err {rels:.3e}"
+    # Compare at the same fitted parameters even when the optimizers found
+    # different optima. This checks forecast values on every acceptance path.
+    data = con.execute("SELECT * FROM _hv_dat ORDER BY t").df()
+    params = con.execute(
+        f"SELECT value FROM _hv_m_{fx} WHERE kind = 'param' ORDER BY idx"
+    ).fetchnumpy()["value"]
+    reference = SARIMAX(
+        data["y"].to_numpy(),
+        exog=data[cols].to_numpy() if cols else None,
+        order=tuple(int(spec[k]) for k in ("p", "d", "q")),
+        seasonal_order=tuple(int(spec[k]) for k in ("bigp", "bigd", "bigq", "s")),
+        trend=v2_trend_arg(fx), simple_differencing=False,
+        concentrate_scale=bool(spec["conc"]),
+        enforce_stationarity=True, enforce_invertibility=True,
+    )
+    reference.ssm.tolerance = 0.0
+    future = (con.execute("SELECT * FROM _hv_fut ORDER BY t").df()[cols].to_numpy()
+              if cols else None)
+    expected = reference.filter(params).get_forecast(H, exog=future)
+    np.testing.assert_allclose(fc["yhat"], expected.predicted_mean,
+                               rtol=1e-6, atol=1e-8, err_msg=f"{fx}: live forecast mean")
+    np.testing.assert_allclose(fc["se"], expected.se_mean,
+                               rtol=1e-5, atol=1e-8, err_msg=f"{fx}: live forecast se")
     # sdiff = 0: the model scale IS the original scale, so the fc_orig stage
     # must be an exact identity
     np.testing.assert_array_equal(fc["yhat"].to_numpy(),
